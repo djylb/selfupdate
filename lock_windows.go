@@ -27,16 +27,23 @@ var (
 )
 
 // openLockFile opens the lock file sharing everything, delete included,
-// so that its holder can delete it while others have it open.
+// so that its holder can delete it while others have it open. It asks for
+// no delete access itself: a handle another program opened without
+// sharing delete, such as a scanner's, would otherwise make the open fail.
 func openLockFile(p string) (*os.File, error) {
+	return createShared(p, syscall.GENERIC_READ|syscall.GENERIC_WRITE, syscall.OPEN_ALWAYS)
+}
+
+// createShared opens p with the given access, sharing read, write and
+// delete.
+func createShared(p string, access, disposition uint32) (*os.File, error) {
 	name, err := syscall.UTF16PtrFromString(p)
 	if err != nil {
 		return nil, &os.PathError{Op: "open", Path: p, Err: err}
 	}
-	h, err := syscall.CreateFile(name,
-		syscall.GENERIC_READ|syscall.GENERIC_WRITE|accessDelete,
+	h, err := syscall.CreateFile(name, access,
 		syscall.FILE_SHARE_READ|syscall.FILE_SHARE_WRITE|syscall.FILE_SHARE_DELETE,
-		nil, syscall.OPEN_ALWAYS, syscall.FILE_ATTRIBUTE_NORMAL, 0)
+		nil, disposition, syscall.FILE_ATTRIBUTE_NORMAL, 0)
 	if err != nil {
 		return nil, &os.PathError{Op: "open", Path: p, Err: err}
 	}
@@ -69,13 +76,27 @@ func unlockSystem(f *os.File) {
 	})
 }
 
-// removeLocked deletes the lock file through its handle with POSIX
-// semantics: the name goes at once, while open handles stay valid. File
-// systems without them keep the file, which does no harm; a classic
-// delete would instead leave a name nobody can open until every handle
-// is closed.
-func removeLocked(f *os.File, _ string) {
-	_ = handleCall(f, func(h uintptr) error {
+// removeLocked deletes the held lock file f at p with POSIX semantics:
+// the name goes at once, while open handles stay valid. It opens a second
+// handle with delete access for that, and deletes only if that handle is
+// still f's file. A file that cannot be deleted, because another program
+// has it open without sharing delete or the file system lacks POSIX
+// semantics, stays and does no harm; a classic delete would instead leave
+// a name nobody can open until every handle is closed.
+func removeLocked(f *os.File, p string) {
+	d, err := createShared(p, accessDelete|syscall.GENERIC_READ, syscall.OPEN_EXISTING)
+	if err != nil {
+		return
+	}
+	defer closeQuietly(d)
+	a, err := f.Stat()
+	if err != nil {
+		return
+	}
+	if b, err := d.Stat(); err != nil || !os.SameFile(a, b) {
+		return
+	}
+	_ = handleCall(d, func(h uintptr) error {
 		info := uint32(fileDispositionDelete | fileDispositionPosixSemantics)
 		r, _, e := procSetFileInformationByHandle.Call(h, fileDispositionInfoEx, uintptr(unsafe.Pointer(&info)), unsafe.Sizeof(info))
 		if r == 0 {
