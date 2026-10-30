@@ -75,9 +75,9 @@ func run(args []string, stdin io.Reader, stdout io.Writer) error {
 }
 
 func keygen(args []string, _ io.Reader, stdout io.Writer) error {
-	fs := flag.NewFlagSet("keygen", flag.ContinueOnError)
-	out := fs.String("out", "", "file to write the private key to (required, must not exist)")
-	if err := fs.Parse(args); err != nil {
+	flags := flag.NewFlagSet("keygen", flag.ContinueOnError)
+	out := flags.String("out", "", "file to write the private key to (required, must not exist)")
+	if err := flags.Parse(args); err != nil {
 		return err
 	}
 	if *out == "" {
@@ -99,9 +99,9 @@ func printPublic(w io.Writer, pub ed25519.PublicKey) error {
 }
 
 func pubkey(args []string, _ io.Reader, stdout io.Writer) error {
-	fs := flag.NewFlagSet("pubkey", flag.ContinueOnError)
-	key := fs.String("key", "", "private key file (required)")
-	if err := fs.Parse(args); err != nil {
+	flags := flag.NewFlagSet("pubkey", flag.ContinueOnError)
+	key := flags.String("key", "", "private key file (required)")
+	if err := flags.Parse(args); err != nil {
 		return err
 	}
 	priv, err := readPrivate(*key)
@@ -113,27 +113,27 @@ func pubkey(args []string, _ io.Reader, stdout io.Writer) error {
 }
 
 func artifact(args []string, _ io.Reader, stdout io.Writer) error {
-	fs := flag.NewFlagSet("artifact", flag.ContinueOnError)
+	flags := flag.NewFlagSet("artifact", flag.ContinueOnError)
 	var a selfupdate.Artifact
 	var format selfupdate.Format
 	var members stringList
-	fs.StringVar(&a.Name, "name", "", "logical artifact name (required)")
-	fs.StringVar(&a.OS, "os", "", "GOOS, empty for any")
-	fs.StringVar(&a.Arch, "arch", "", "GOARCH, empty for any")
-	fs.StringVar(&a.URL, "url", "", "artifact URL, may be relative to the manifest; default the file name")
-	fs.TextVar(&format, "format", selfupdate.FormatUnknown, "raw, gz, tar, tar.gz or zip; default implied by the file name")
-	fs.Var(&members, "member", "file the archive must hold (repeatable)")
-	into := fs.String("into", "", "manifest JSON file to add the artifact to")
-	version := fs.String("version", "", "release version, with -into")
-	channel := fs.String("channel", "", "release channel of a new release, with -into")
-	notes := fs.String("notes", "", "release notes of a new release, with -into")
-	if err := fs.Parse(args); err != nil {
+	flags.StringVar(&a.Name, "name", "", "logical artifact name (required)")
+	flags.StringVar(&a.OS, "os", "", "GOOS, empty for any")
+	flags.StringVar(&a.Arch, "arch", "", "GOARCH, empty for any")
+	flags.StringVar(&a.URL, "url", "", "artifact URL, may be relative to the manifest; default the file name")
+	flags.TextVar(&format, "format", selfupdate.FormatUnknown, "raw, gz, tar, tar.gz or zip; default implied by the file name")
+	flags.Var(&members, "member", "file the archive must hold (repeatable)")
+	into := flags.String("into", "", "manifest JSON file to add the artifact to")
+	version := flags.String("version", "", "release version, with -into")
+	channel := flags.String("channel", "", "release channel of a new release, with -into")
+	notes := flags.String("notes", "", "release notes of a new release, with -into")
+	if err := flags.Parse(args); err != nil {
 		return err
 	}
-	if fs.NArg() != 1 || a.Name == "" {
+	if flags.NArg() != 1 || a.Name == "" {
 		return errors.New("artifact: expects -name and one file")
 	}
-	file := fs.Arg(0)
+	file := flags.Arg(0)
 	implied := selfupdate.FormatOf(file)
 	switch {
 	case format == selfupdate.FormatUnknown && implied == selfupdate.FormatUnknown:
@@ -277,13 +277,13 @@ func readTrust(pubs []string) (selfupdate.Trust, error) {
 }
 
 func signCmd(args []string, stdin io.Reader, stdout io.Writer) error {
-	fs := flag.NewFlagSet("sign", flag.ContinueOnError)
+	flags := flag.NewFlagSet("sign", flag.ContinueOnError)
 	var keys stringList
-	fs.Var(&keys, "key", "private key file (repeatable)")
-	expires := fs.Duration("expires", 30*24*time.Hour, "validity from now")
-	in := fs.String("in", "-", "manifest JSON")
-	out := fs.String("out", "-", "signed manifest")
-	if err := fs.Parse(args); err != nil {
+	flags.Var(&keys, "key", "private key file (repeatable)")
+	expires := flags.Duration("expires", 30*24*time.Hour, "validity from now")
+	in := flags.String("in", "-", "manifest JSON")
+	out := flags.String("out", "-", "signed manifest")
+	if err := flags.Parse(args); err != nil {
 		return err
 	}
 	privs, err := readPrivates(keys)
@@ -311,13 +311,13 @@ func signCmd(args []string, stdin io.Reader, stdout io.Writer) error {
 }
 
 func verify(args []string, stdin io.Reader, stdout io.Writer) error {
-	fs := flag.NewFlagSet("verify", flag.ContinueOnError)
+	flags := flag.NewFlagSet("verify", flag.ContinueOnError)
 	var pubs stringList
-	fs.Var(&pubs, "pub", "trusted public key (repeatable)")
-	in := fs.String("in", "-", "signed manifest")
-	dist := fs.String("dist", "", "directory to check the artifacts with relative URLs against")
-	fetch := fs.Bool("fetch", false, "download and check the artifacts with absolute http(s) URLs")
-	if err := fs.Parse(args); err != nil {
+	flags.Var(&pubs, "pub", "trusted public key (repeatable)")
+	in := flags.String("in", "-", "signed manifest")
+	dist := flags.String("dist", "", "directory to check the artifacts with relative URLs against")
+	fetch := flags.Bool("fetch", false, "download and check the artifacts with absolute http(s) URLs")
+	if err := flags.Parse(args); err != nil {
 		return err
 	}
 	t, err := readTrust(pubs)
@@ -398,21 +398,21 @@ func checkArtifacts(ctx context.Context, dir string, fetch bool, m *selfupdate.M
 }
 
 func signFile(args []string, _ io.Reader, stdout io.Writer) error {
-	fs := flag.NewFlagSet("sign-file", flag.ContinueOnError)
+	flags := flag.NewFlagSet("sign-file", flag.ContinueOnError)
 	var keys stringList
-	fs.Var(&keys, "key", "private key file (repeatable)")
-	out := fs.String("out", "-", "signature file")
-	if err := fs.Parse(args); err != nil {
+	flags.Var(&keys, "key", "private key file (repeatable)")
+	out := flags.String("out", "-", "signature file")
+	if err := flags.Parse(args); err != nil {
 		return err
 	}
-	if fs.NArg() != 1 {
+	if flags.NArg() != 1 {
 		return errors.New("sign-file: expects one file")
 	}
 	privs, err := readPrivates(keys)
 	if err != nil {
 		return fmt.Errorf("sign-file: %w", err)
 	}
-	f, err := os.Open(fs.Arg(0))
+	f, err := os.Open(flags.Arg(0))
 	if err != nil {
 		return err
 	}
@@ -429,14 +429,14 @@ func signFile(args []string, _ io.Reader, stdout io.Writer) error {
 }
 
 func verifyFile(args []string, _ io.Reader, stdout io.Writer) error {
-	fs := flag.NewFlagSet("verify-file", flag.ContinueOnError)
+	flags := flag.NewFlagSet("verify-file", flag.ContinueOnError)
 	var pubs stringList
-	fs.Var(&pubs, "pub", "trusted public key (repeatable)")
-	sigFile := fs.String("sig", "", "signature file (required)")
-	if err := fs.Parse(args); err != nil {
+	flags.Var(&pubs, "pub", "trusted public key (repeatable)")
+	sigFile := flags.String("sig", "", "signature file (required)")
+	if err := flags.Parse(args); err != nil {
 		return err
 	}
-	if fs.NArg() != 1 || *sigFile == "" {
+	if flags.NArg() != 1 || *sigFile == "" {
 		return errors.New("verify-file: expects -sig and one file")
 	}
 	t, err := readTrust(pubs)
@@ -456,7 +456,7 @@ func verifyFile(args []string, _ io.Reader, stdout io.Writer) error {
 	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
 		return fmt.Errorf("%s: trailing data", *sigFile)
 	}
-	f, err := os.Open(fs.Arg(0))
+	f, err := os.Open(flags.Arg(0))
 	if err != nil {
 		return err
 	}
