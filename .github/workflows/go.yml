@@ -60,8 +60,9 @@ jobs:
             export GOOS=${target%/*} GOARCH=${target#*/} CGO_ENABLED=0
             echo "::group::$target"
             if [ "$GOOS" = ios ]; then
-              # ios binaries need cgo to link, so only vet it (vet needs no C compiler).
-              CGO_ENABLED=1 go vet ./... || failed+=("$target")
+              # ios binaries need cgo to link, so only vet it. Main packages pull
+              # in runtime/cgo, which needs an ios C toolchain: vet the libraries.
+              CGO_ENABLED=1 go vet $(go list -f '{{if ne .Name "main"}}{{.ImportPath}}{{end}}' ./...) || failed+=("$target")
             else
               { go vet ./... && go test -c -o /dev/null ./...; } || failed+=("$target")
             fi
