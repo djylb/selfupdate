@@ -61,8 +61,9 @@ type Artifact struct {
 	// which suits data files.
 	OS   string `json:"os,omitempty"`
 	Arch string `json:"arch,omitempty"`
-	// URL locates the file. A relative URL is resolved against the URL the
-	// manifest was fetched from.
+	// URL locates the file; the [Source] interprets it. [HTTPSource] resolves
+	// a relative URL against the manifest URL, [DirSource] takes a path
+	// below its directory.
 	URL string `json:"url"`
 	// SHA256 and SHA512 are hex digests of the file. At least one is
 	// required; when both are present both are checked.
@@ -87,7 +88,7 @@ func DigestsOf(data []byte) Digests {
 
 // Check reports whether size and d match the artifact. It also rejects an
 // artifact that pins no digest or no size, so a manifest cannot leave the
-// content open.
+// content open. Only the digests the artifact lists are compared.
 func (a *Artifact) Check(size int64, d Digests) error {
 	if err := a.validate(); err != nil {
 		return err
@@ -136,7 +137,8 @@ func isHex(s string, n int) bool {
 }
 
 // Artifact returns the artifact of r with the given name for goos and
-// goarch. An artifact without OS or Arch matches any value.
+// goarch. An artifact without OS or Arch matches any value. A valid manifest
+// never lists two artifacts that match the same request.
 func (r *Release) Artifact(name, goos, goarch string) (Artifact, bool) {
 	for _, a := range r.Artifacts {
 		if a.Name == name && (a.OS == "" || a.OS == goos) && (a.Arch == "" || a.Arch == goarch) {
@@ -202,14 +204,14 @@ func OpenManifest(data []byte, t Trust, now time.Time) (*Opened, error) {
 	if err := dec.Decode(&env); err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrMalformedManifest, err)
 	}
-	if dec.More() {
-		return nil, fmt.Errorf("%w: trailing data", ErrMalformedManifest)
+	if err := atEOF(dec); err != nil {
+		return nil, err
 	}
 	ids, err := t.verify(manifestContext, env.Payload, env.Signatures, now)
 	if err != nil {
 		return nil, err
 	}
-	m, err := decodePayload(env.Payload)
+	m, err := DecodeManifest(env.Payload)
 	if err != nil {
 		return nil, err
 	}
@@ -222,11 +224,13 @@ func OpenManifest(data []byte, t Trust, now time.Time) (*Opened, error) {
 	return &Opened{Manifest: m, KeyIDs: ids}, nil
 }
 
-// decodePayload decodes a signed payload strictly, so that every client,
-// in any language, reads the same signed bytes the same way: unknown
-// fields, duplicate keys (compared case-insensitively, as decoding
-// matches them) and trailing data are rejected.
-func decodePayload(payload []byte) (*Manifest, error) {
+// DecodeManifest decodes the JSON form of a [Manifest] strictly, the way
+// [OpenManifest] decodes a signed payload, so that every reader in any
+// language sees the same content: unknown fields, duplicate keys (compared
+// case-insensitively, as decoding matches them) and trailing data are
+// rejected. It does not validate the manifest; publishers use it to read
+// a manifest before signing it.
+func DecodeManifest(payload []byte) (*Manifest, error) {
 	if err := checkDuplicateKeys(payload); err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrMalformedManifest, err)
 	}
@@ -236,8 +240,8 @@ func decodePayload(payload []byte) (*Manifest, error) {
 	if err := dec.Decode(m); err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrMalformedManifest, err)
 	}
-	if dec.More() {
-		return nil, fmt.Errorf("%w: trailing data", ErrMalformedManifest)
+	if err := atEOF(dec); err != nil {
+		return nil, err
 	}
 	return m, nil
 }
@@ -290,23 +294,53 @@ func checkDuplicateKeys(data []byte) error {
 	}
 }
 
+// atEOF checks that nothing but white space follows the decoded value.
+func atEOF(dec *json.Decoder) error {
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return fmt.Errorf("%w: trailing data", ErrMalformedManifest)
+	}
+	return nil
+}
+
 func (m *Manifest) validate() error {
-	if m.Product == "" {
+	switch {
+	case m.Product == "":
 		return fmt.Errorf("%w: no product", ErrMalformedManifest)
-	}
-	if m.Expires.IsZero() {
+	case m.Expires.IsZero():
 		return ErrNoExpiry
+	case m.Published.IsZero():
+		return fmt.Errorf("%w: no publication time", ErrMalformedManifest)
+	case !m.Published.Before(m.Expires):
+		return fmt.Errorf("%w: published after it expires", ErrMalformedManifest)
 	}
+	versions := make([]Version, 0, len(m.Releases))
 	for i := range m.Releases {
 		r := &m.Releases[i]
-		if _, err := ParseVersion(r.Version); err != nil {
+		v, err := ParseVersion(r.Version)
+		if err != nil {
 			return fmt.Errorf("%w: release %q: %w", ErrMalformedManifest, r.Version, err)
 		}
+		for _, o := range versions {
+			if v.Compare(o) == 0 {
+				return fmt.Errorf("%w: version %s listed twice", ErrMalformedManifest, r.Version)
+			}
+		}
+		versions = append(versions, v)
 		for j := range r.Artifacts {
-			if err := r.Artifacts[j].validate(); err != nil {
+			a := &r.Artifacts[j]
+			if err := a.validate(); err != nil {
 				return err
+			}
+			for _, o := range r.Artifacts[:j] {
+				if o.Name == a.Name && overlaps(o.OS, a.OS) && overlaps(o.Arch, a.Arch) {
+					return fmt.Errorf("%w: release %s: artifacts for %s overlap", ErrMalformedManifest, r.Version, a.Name)
+				}
 			}
 		}
 	}
 	return nil
 }
+
+// overlaps reports whether two platform fields match a common value; empty
+// matches every value.
+func overlaps(a, b string) bool { return a == "" || b == "" || a == b }

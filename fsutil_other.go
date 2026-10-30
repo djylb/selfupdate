@@ -2,12 +2,10 @@
 
 package selfupdate
 
-import (
-	"io/fs"
-	"os"
-)
+import "io/fs"
 
-func renameFile(from, to string) error { return os.Rename(from, to) }
+// transientRenameErrors is empty: renames here fail for good or not at all.
+var transientRenameErrors []error
 
 func copyOwner(string, fs.FileInfo) error { return nil }
 

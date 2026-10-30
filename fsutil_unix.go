@@ -9,7 +9,8 @@ import (
 	"syscall"
 )
 
-func renameFile(from, to string) error { return os.Rename(from, to) }
+// transientRenameErrors is empty: renames here fail for good or not at all.
+var transientRenameErrors []error
 
 // copyOwner gives p the owner and group of fi where the process may set
 // them; an unprivileged process keeps its own.

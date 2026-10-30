@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"slices"
 	"time"
 
 	"github.com/djylb/selfupdate"
@@ -14,14 +15,22 @@ import (
 // The release key's public half, compiled into the program.
 const releaseKey = "ed25519:11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo="
 
+// Settings the program keeps between runs, such as in its configuration
+// directory.
+var (
+	minPublished time.Time
+	rolledBack   []string
+)
+
 // Example shows the life cycle of a program that updates itself.
 func Example() {
+	ctx := context.Background()
 	// First thing on every start: finish or undo an earlier update.
 	j, err := selfupdate.ExecutableJournal()
 	if err != nil {
 		log.Fatal(err)
 	}
-	out, err := j.Startup(1)
+	out, err := j.Startup(ctx, 1)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -29,13 +38,15 @@ func Example() {
 	case selfupdate.StatusPending:
 		// Running the new version for the first time: check health, then
 		// confirm. Exiting without Commit rolls back on the next start.
-		if err := j.Commit(); err != nil {
+		if err := j.Commit(ctx); err != nil {
 			log.Print(err)
 		}
 	case selfupdate.StatusRolledBack:
-		// The old files are back; run them.
-		log.Fatal(selfupdate.Relaunch(os.Args[0], os.Args))
-	case selfupdate.StatusIdle:
+		// The old files are back: never offer this version again, and
+		// run the old code.
+		rolledBack = append(rolledBack, out.Version)
+		restart()
+	case selfupdate.StatusIdle, selfupdate.StatusInProgress, selfupdate.StatusCleanup:
 	}
 
 	pub, err := selfupdate.ParsePublicKey(releaseKey)
@@ -43,25 +54,37 @@ func Example() {
 		log.Fatal(err)
 	}
 	u := &selfupdate.Updater{
-		Source:  &selfupdate.HTTPSource{URL: "https://updates.example.com/app/manifest.json"},
-		Trust:   selfupdate.Trust{Keys: []selfupdate.TrustedKey{{Public: pub}}},
-		Product: "app",
-		Current: "1.4.2",
+		Source:       &selfupdate.HTTPSource{URL: "https://updates.example.com/app/manifest.json"},
+		Trust:        selfupdate.Trust{Keys: []selfupdate.TrustedKey{{Public: pub}}},
+		Product:      "app",
+		Current:      "1.4.2",
+		MinPublished: minPublished,
+		OnManifest: func(_ context.Context, o *selfupdate.Opened) error {
+			minPublished = o.Manifest.Published // persist it
+			return nil
+		},
+		Skip: func(v string) bool { return slices.Contains(rolledBack, v) },
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	c, err := u.Update(ctx)
 	cancel()
 	switch {
-	case errors.Is(err, selfupdate.ErrUpToDate):
+	case errors.Is(err, selfupdate.ErrUpToDate), errors.Is(err, selfupdate.ErrPendingRestart):
 		return
 	case err != nil:
 		log.Print(err)
 		return
 	}
 	log.Printf("installed %s, restarting", c.Version)
-	if err := selfupdate.Relaunch(os.Args[0], os.Args); err == nil {
-		os.Exit(0) // Windows: the new process has started
+	restart()
+}
+
+// restart runs the program again on the code now on disk.
+func restart() {
+	if err := selfupdate.Relaunch("", nil); err != nil {
+		log.Fatal(err)
 	}
+	os.Exit(0) // Windows: the new process has started
 }
 
 // ExampleSignManifest shows how a publisher produces a manifest.
@@ -96,17 +119,25 @@ func ExampleSignManifest() {
 }
 
 // ExampleUpdater_Install updates a data file, such as a rule database,
-// with no confirmation step.
+// with no confirmation step, from a directory such as a mounted drive.
+// The data file has its own journal, so it never waits for a pending
+// update of the program.
 func ExampleUpdater_Install() {
 	pub, _ := selfupdate.ParsePublicKey(releaseKey)
+	const db = "/var/lib/app/rules.db"
 	u := &selfupdate.Updater{
-		Source:  &selfupdate.HTTPSource{URL: "https://updates.example.com/rules/manifest.json"},
+		Source:  &selfupdate.DirSource{Dir: "/media/usb/rules"},
 		Trust:   selfupdate.Trust{Keys: []selfupdate.TrustedKey{{Public: pub}}},
 		Product: "rules",
 		Current: "2026.10.1",
-		Files:   []selfupdate.File{{Target: "/var/lib/app/rules.db", Mode: 0o644}},
+		Files:   []selfupdate.File{{Target: db}},
+		Journal: selfupdate.JournalFor(db),
 	}
 	ctx := context.Background()
+	if _, err := u.Journal.Recover(ctx); err != nil {
+		log.Print(err)
+		return
+	}
 	c, err := u.Check(ctx)
 	if err != nil {
 		return

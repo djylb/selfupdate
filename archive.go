@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"archive/zip"
 	"compress/gzip"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -11,7 +12,6 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"slices"
 	"strings"
 )
 
@@ -24,7 +24,8 @@ const (
 	FormatUnknown Format = iota
 	// FormatRaw is a file stored as is.
 	FormatRaw
-	// FormatGzip is a single gzip-compressed file.
+	// FormatGzip is a single gzip-compressed file. A file of several gzip
+	// members, as concatenation produces, holds their contents in order.
 	FormatGzip
 	// FormatTar is an uncompressed tar archive.
 	FormatTar
@@ -44,6 +45,9 @@ var formatNames = [...]string{
 }
 
 func (f Format) valid() bool { return f > FormatUnknown && int(f) < len(formatNames) }
+
+// archive reports whether the format holds named entries.
+func (f Format) archive() bool { return f == FormatTar || f == FormatTarGzip || f == FormatZip }
 
 // String returns the name used in manifests: "raw", "gz", "tar", "tar.gz"
 // or "zip".
@@ -80,6 +84,24 @@ func (f *Format) UnmarshalText(b []byte) error {
 	return fmt.Errorf("selfupdate: unknown format %q", s)
 }
 
+// FormatOf returns the format a file name's extension implies: ".tar.gz"
+// or ".tgz", ".tar", ".zip" and ".gz". Other names, which may be raw files
+// or anything else, yield [FormatUnknown].
+func FormatOf(name string) Format {
+	name = strings.ToLower(name)
+	switch {
+	case strings.HasSuffix(name, ".tar.gz"), strings.HasSuffix(name, ".tgz"):
+		return FormatTarGzip
+	case strings.HasSuffix(name, ".tar"):
+		return FormatTar
+	case strings.HasSuffix(name, ".zip"):
+		return FormatZip
+	case strings.HasSuffix(name, ".gz"):
+		return FormatGzip
+	}
+	return FormatUnknown
+}
+
 // Errors returned by extraction.
 var (
 	ErrUnsafeEntry   = errors.New("selfupdate: unsafe archive entry")
@@ -87,31 +109,35 @@ var (
 	ErrTooLarge      = errors.New("selfupdate: size limit exceeded")
 )
 
-// Limits bounds what extraction reads and writes. Zero fields take the
+// ExtractOptions bounds and observes extraction. Zero fields take the
 // defaults noted on each field.
-type Limits struct {
+type ExtractOptions struct {
+	// Progress, when set, is called on the extracting goroutine with the
+	// number of bytes of the artifact read so far and its size. Entries
+	// that need not be read (zip entries not selected) are skipped, so
+	// the count may stop short of the size.
+	Progress ProgressFunc
 	// MaxFileSize bounds each extracted file. Default 1 GiB.
 	MaxFileSize int64
 	// MaxTotalSize bounds all bytes decompressed. For gzip files and tar
-	// archives this
-	// includes skipped entries, which must be read past; zip entries are
-	// only read when extracted. Default 4 GiB.
+	// archives this includes skipped entries, which must be read past; zip
+	// entries are only read when extracted. Default 4 GiB.
 	MaxTotalSize int64
 	// MaxEntries bounds the number of archive entries. Default 100000.
 	MaxEntries int
 }
 
-func (l Limits) withDefaults() Limits {
-	if l.MaxFileSize <= 0 {
-		l.MaxFileSize = 1 << 30
+func (o ExtractOptions) withDefaults() ExtractOptions {
+	if o.MaxFileSize <= 0 {
+		o.MaxFileSize = 1 << 30
 	}
-	if l.MaxTotalSize <= 0 {
-		l.MaxTotalSize = 4 << 30
+	if o.MaxTotalSize <= 0 {
+		o.MaxTotalSize = 4 << 30
 	}
-	if l.MaxEntries <= 0 {
-		l.MaxEntries = 100000
+	if o.MaxEntries <= 0 {
+		o.MaxEntries = 100000
 	}
-	return l
+	return o
 }
 
 // Member selects one file to extract.
@@ -127,56 +153,99 @@ type Member struct {
 	Mode fs.FileMode
 }
 
-// Extract writes the selected members of the archive at src to their
-// paths. Output paths come only from members, never from the archive, so
-// entry names cannot escape. A selected entry that is not a regular file
-// (a symlink, hard link or device) is an error, as is a selected name that
-// occurs twice or is missing. On error the files written so far are
-// removed.
-func Extract(src string, format Format, members []Member, limits Limits) (err error) {
-	limits = limits.withDefaults()
+// input reads the artifact for extraction, checking ctx and reporting
+// progress on every read.
+type input struct {
+	ctx      context.Context
+	r        io.ReaderAt
+	progress ProgressFunc
+	size     int64
+	read     int64
+}
+
+func (in *input) ReadAt(p []byte, off int64) (int, error) {
+	if err := in.ctx.Err(); err != nil {
+		return 0, err
+	}
+	n, err := in.r.ReadAt(p, off)
+	if n > 0 && in.progress != nil {
+		in.read = min(in.read+int64(n), in.size)
+		in.progress(in.read, in.size)
+	}
+	return n, err
+}
+
+func (in *input) stream() io.Reader { return io.NewSectionReader(in, 0, in.size) }
+
+// Extract writes the selected members of the artifact src, of size bytes,
+// to their paths. Output paths come only from members, never from the
+// archive, so entry names cannot escape. A selected entry that is not a
+// regular file (a symlink, hard link or device) is an error, as is a
+// selected name that occurs twice or is missing. On error the files
+// written so far are removed; files that existed before are never
+// touched. ctx cancels a long extraction.
+func Extract(ctx context.Context, src io.ReaderAt, size int64, format Format, members []Member, opts ExtractOptions) (err error) {
+	opts = opts.withDefaults()
+	names, paths := map[string]bool{}, map[string]bool{}
 	for _, m := range members {
 		if m.Path == "" {
 			return errors.New("selfupdate: member without path")
 		}
-		if (format == FormatTar || format == FormatTarGzip || format == FormatZip) && !fs.ValidPath(m.Name) {
+		if format.archive() && !fs.ValidPath(m.Name) {
 			return fmt.Errorf("%w: invalid member name %q", ErrUnsafeEntry, m.Name)
 		}
+		if names[m.Name] || paths[m.Path] {
+			return fmt.Errorf("selfupdate: member %q or path %s given twice", m.Name, m.Path)
+		}
+		names[m.Name], paths[m.Path] = true, true
 	}
-	var written []string
+	in := &input{ctx: ctx, r: src, size: size, progress: opts.Progress}
+	written := map[string]bool{} // member names extracted
+	var created []string
 	defer func() {
 		if err != nil {
-			for _, p := range written {
+			for _, p := range created {
 				_ = os.Remove(p)
 			}
 		}
 	}()
 	write := func(m Member, r io.Reader) error {
-		written = append(written, m.Path)
-		return writeLimited(m.Path, m.Mode, r, limits.MaxFileSize)
+		if written[m.Name] {
+			return fmt.Errorf("%w: duplicate entry %s", ErrUnsafeEntry, m.Name)
+		}
+		// writeLimited removes what it created if it fails, and never
+		// replaces an existing file.
+		if err := writeLimited(m.Path, m.Mode, r, opts.MaxFileSize); err != nil {
+			return err
+		}
+		written[m.Name] = true
+		created = append(created, m.Path)
+		return nil
+	}
+	allFound := func() error {
+		for _, m := range members {
+			if !written[m.Name] {
+				return fmt.Errorf("%w: %s", ErrMissingMember, m.Name)
+			}
+		}
+		return nil
 	}
 	switch format {
 	case FormatRaw, FormatGzip:
 		if len(members) != 1 {
 			return errors.New("selfupdate: a single-file format takes exactly one member")
 		}
-		f, err := os.Open(src)
-		if err != nil {
-			return err
-		}
-		defer closeQuietly(f)
-		var r io.Reader = f
+		r := in.stream()
 		if format == FormatGzip {
-			zr, err := gzip.NewReader(f)
+			zr, err := gzip.NewReader(r)
 			if err != nil {
 				return err
 			}
-			zr.Multistream(false)
 			r = zr
 		}
-		return write(members[0], &countingReader{r: r, limit: limits.MaxTotalSize})
+		return write(members[0], &countingReader{r: r, limit: opts.MaxTotalSize})
 	case FormatTar, FormatTarGzip:
-		return walkTar(src, format == FormatTarGzip, limits, func(name string, h *tar.Header, r io.Reader) error {
+		return walkTar(in, format == FormatTarGzip, opts, func(name string, h *tar.Header, r io.Reader) error {
 			m, ok := pick(members, name)
 			if !ok {
 				return nil
@@ -184,13 +253,10 @@ func Extract(src string, format Format, members []Member, limits Limits) (err er
 			if h.Typeflag != tar.TypeReg {
 				return fmt.Errorf("%w: %s is not a regular file", ErrUnsafeEntry, name)
 			}
-			if slices.Contains(written, m.Path) {
-				return fmt.Errorf("%w: duplicate entry %s", ErrUnsafeEntry, name)
-			}
 			return write(m, r)
-		}, func() error { return missing(members, written) })
+		}, allFound)
 	case FormatZip:
-		return walkZip(src, limits, func(name string, zf *zip.File, r io.Reader) error {
+		return walkZip(in, opts, func(name string, zf *zip.File, r io.Reader) error {
 			m, ok := pick(members, name)
 			if !ok {
 				return nil
@@ -198,28 +264,31 @@ func Extract(src string, format Format, members []Member, limits Limits) (err er
 			if !zf.Mode().IsRegular() {
 				return fmt.Errorf("%w: %s is not a regular file", ErrUnsafeEntry, name)
 			}
-			if slices.Contains(written, m.Path) {
-				return fmt.Errorf("%w: duplicate entry %s", ErrUnsafeEntry, name)
-			}
 			return write(m, r)
-		}, func() error { return missing(members, written) })
+		}, allFound)
 	case FormatUnknown:
 	}
 	return fmt.Errorf("selfupdate: cannot extract format %v", format)
 }
 
 // ExtractDir writes every regular file under prefix in the tar, tar.gz or
-// zip archive at src into the directory dst, which must not exist yet.
-// Entry names are checked with [filepath.Localize]: absolute paths, ".."
-// elements, backslashes and names reserved on Windows are rejected, as are
-// symlinks, hard links and devices. Directory entries are implied. Files
-// are written with mode 0o755 if the archive marks them executable and
-// 0o644 otherwise; setuid, setgid and sticky bits are never set. On error
-// dst is removed.
-func ExtractDir(src string, format Format, prefix string, dst string, limits Limits) (err error) {
-	limits = limits.withDefaults()
+// zip artifact src, of size bytes, into the directory dst, which must not
+// exist yet; its parent must. Entry names are checked with
+// [filepath.Localize]: absolute paths, ".." elements, backslashes and
+// names reserved on Windows are rejected, as are symlinks, hard links and
+// devices. Directory entries are implied. Files are written with mode
+// 0o755 if the archive marks them executable and 0o644 otherwise;
+// setuid, setgid and sticky bits are never set. Files and directories are
+// synced, so dst can be swapped in by a [Journal]. An archive with no
+// regular file under prefix fails with [ErrMissingMember]. On error dst is
+// removed. ctx cancels a long extraction.
+func ExtractDir(ctx context.Context, src io.ReaderAt, size int64, format Format, prefix string, dst string, opts ExtractOptions) (err error) {
+	opts = opts.withDefaults()
 	if prefix != "" && !fs.ValidPath(prefix) {
 		return fmt.Errorf("%w: invalid prefix %q", ErrUnsafeEntry, prefix)
+	}
+	if !format.archive() {
+		return fmt.Errorf("selfupdate: format %v holds no directory", format)
 	}
 	if err := os.Mkdir(dst, 0o755); err != nil {
 		return err
@@ -229,7 +298,8 @@ func ExtractDir(src string, format Format, prefix string, dst string, limits Lim
 			_ = os.RemoveAll(dst)
 		}
 	}()
-	var seen []string
+	seen := map[string]bool{}
+	dirs := map[string]bool{".": true}
 	visit := func(name string, regular, dir bool, exec bool, r io.Reader) error {
 		rel, ok := under(name, prefix)
 		if !ok {
@@ -244,38 +314,47 @@ func ExtractDir(src string, format Format, prefix string, dst string, limits Lim
 			return nil
 		case !regular:
 			return fmt.Errorf("%w: %s is not a regular file", ErrUnsafeEntry, name)
-		case slices.Contains(seen, local):
+		case seen[local]:
 			return fmt.Errorf("%w: duplicate entry %s", ErrUnsafeEntry, name)
 		}
-		seen = append(seen, local)
-		out := filepath.Join(dst, local)
-		if err := mkdirUnder(dst, filepath.Dir(local)); err != nil {
+		seen[local] = true
+		parent := filepath.Dir(local)
+		if err := mkdirUnder(dst, parent); err != nil {
 			return err
+		}
+		for d := parent; !dirs[d]; d = filepath.Dir(d) {
+			dirs[d] = true
 		}
 		mode := fs.FileMode(0o644)
 		if exec {
 			mode = 0o755
 		}
-		return writeLimited(out, mode, r, limits.MaxFileSize)
+		return writeLimited(filepath.Join(dst, local), mode, r, opts.MaxFileSize)
 	}
-	done := func() error { return nil }
-	switch format {
-	case FormatTar, FormatTarGzip:
-		return walkTar(src, format == FormatTarGzip, limits, func(name string, h *tar.Header, r io.Reader) error {
-			return visit(name, h.Typeflag == tar.TypeReg, h.Typeflag == tar.TypeDir, h.Mode&0o111 != 0, r)
-		}, done)
-	case FormatZip:
-		return walkZip(src, limits, func(name string, zf *zip.File, r io.Reader) error {
+	in := &input{ctx: ctx, r: src, size: size, progress: opts.Progress}
+	syncAll := func() error {
+		if len(seen) == 0 {
+			return fmt.Errorf("%w: no files under %q", ErrMissingMember, prefix)
+		}
+		for d := range dirs {
+			if err := syncDir(filepath.Join(dst, d)); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if format == FormatZip {
+		return walkZip(in, opts, func(name string, zf *zip.File, r io.Reader) error {
 			return visit(name, zf.Mode().IsRegular(), zf.Mode().IsDir(), zf.Mode()&0o111 != 0, r)
-		}, done)
-	case FormatUnknown, FormatRaw, FormatGzip:
+		}, syncAll)
 	}
-	return fmt.Errorf("selfupdate: format %v holds no directory", format)
+	return walkTar(in, format == FormatTarGzip, opts, func(name string, h *tar.Header, r io.Reader) error {
+		return visit(name, h.Typeflag == tar.TypeReg, h.Typeflag == tar.TypeDir, h.Mode&0o111 != 0, r)
+	}, syncAll)
 }
 
-// mkdirUnder creates rel below root one element at a time, refusing to
-// pass through anything that is not a directory created by MkdirAll
-// itself; dst is new, so nothing else can be there.
+// mkdirUnder creates rel below root, refusing to pass through anything
+// that is not a directory; root is new, so nothing else can be there.
 func mkdirUnder(root, rel string) error {
 	if rel == "." {
 		return nil
@@ -321,15 +400,6 @@ func pick(members []Member, name string) (Member, bool) {
 	return Member{}, false
 }
 
-func missing(members []Member, written []string) error {
-	for _, m := range members {
-		if !slices.Contains(written, m.Path) {
-			return fmt.Errorf("%w: %s", ErrMissingMember, m.Name)
-		}
-	}
-	return nil
-}
-
 // countingReader fails once more than limit bytes have been read through
 // it in total.
 type countingReader struct {
@@ -347,22 +417,16 @@ func (c *countingReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-func walkTar(src string, gz bool, limits Limits, fn func(string, *tar.Header, io.Reader) error, done func() error) error {
-	f, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer closeQuietly(f)
-	var r io.Reader = f
+func walkTar(in *input, gz bool, opts ExtractOptions, fn func(string, *tar.Header, io.Reader) error, done func() error) error {
+	r := in.stream()
 	if gz {
-		zr, err := gzip.NewReader(f)
+		zr, err := gzip.NewReader(r)
 		if err != nil {
 			return err
 		}
-		zr.Multistream(false)
 		r = zr
 	}
-	tr := tar.NewReader(&countingReader{r: r, limit: limits.MaxTotalSize})
+	tr := tar.NewReader(&countingReader{r: r, limit: opts.MaxTotalSize})
 	for n := 0; ; n++ {
 		h, err := tr.Next()
 		if errors.Is(err, io.EOF) {
@@ -371,8 +435,8 @@ func walkTar(src string, gz bool, limits Limits, fn func(string, *tar.Header, io
 		if err != nil {
 			return err
 		}
-		if n >= limits.MaxEntries {
-			return fmt.Errorf("%w: more than %d entries", ErrTooLarge, limits.MaxEntries)
+		if n >= opts.MaxEntries {
+			return fmt.Errorf("%w: more than %d entries", ErrTooLarge, opts.MaxEntries)
 		}
 		if err := fn(h.Name, h, tr); err != nil {
 			return err
@@ -380,16 +444,15 @@ func walkTar(src string, gz bool, limits Limits, fn func(string, *tar.Header, io
 	}
 }
 
-func walkZip(src string, limits Limits, fn func(string, *zip.File, io.Reader) error, done func() error) error {
-	zr, err := zip.OpenReader(src)
+func walkZip(in *input, opts ExtractOptions, fn func(string, *zip.File, io.Reader) error, done func() error) error {
+	zr, err := zip.NewReader(in, in.size)
 	if err != nil {
 		return err
 	}
-	defer closeQuietly(zr)
-	if len(zr.File) > limits.MaxEntries {
-		return fmt.Errorf("%w: more than %d entries", ErrTooLarge, limits.MaxEntries)
+	if len(zr.File) > opts.MaxEntries {
+		return fmt.Errorf("%w: more than %d entries", ErrTooLarge, opts.MaxEntries)
 	}
-	total := &countingReader{limit: limits.MaxTotalSize}
+	total := &countingReader{limit: opts.MaxTotalSize}
 	for _, zf := range zr.File {
 		if err := visitZip(zf, total, fn); err != nil {
 			return err
@@ -420,7 +483,8 @@ type eofReader struct{}
 func (eofReader) Read([]byte) (int, error) { return 0, io.EOF }
 
 // writeLimited creates path exclusively and copies at most limit bytes
-// from r into it, failing if r holds more.
+// from r into it, failing if r holds more. On failure it removes the file
+// it created; an existing file makes it fail without touching it.
 func writeLimited(p string, mode fs.FileMode, r io.Reader, limit int64) (err error) {
 	if mode == 0 {
 		mode = 0o644

@@ -3,6 +3,7 @@ package selfupdate
 import (
 	"archive/tar"
 	"bytes"
+	"context"
 	"errors"
 	"io/fs"
 	"os"
@@ -19,6 +20,85 @@ func writeTemp(t testing.TB, dir, name string, data []byte) string {
 		t.Fatal(err)
 	}
 	return p
+}
+
+// extractAt and extractDirAt run Extract and ExtractDir on the file src.
+func extractAt(src string, format Format, members []Member, opts ExtractOptions) error {
+	f, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer closeQuietly(f)
+	fi, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	return Extract(context.Background(), f, fi.Size(), format, members, opts)
+}
+
+func extractDirAt(src string, format Format, prefix, dst string, opts ExtractOptions) error {
+	f, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer closeQuietly(f)
+	fi, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	return ExtractDir(context.Background(), f, fi.Size(), format, prefix, dst, opts)
+}
+
+// TestExtractKeepsExistingFiles is a regression test: a member path that
+// already exists made Extract fail and then delete that file.
+func TestExtractKeepsExistingFiles(t *testing.T) {
+	dir := t.TempDir()
+	src := writeTemp(t, dir, "a.tar", tarGz(t, false, tarEntry{name: "a", body: "A"}, tarEntry{name: "b", body: "B"}))
+	keep := writeTemp(t, dir, "keep", []byte("precious"))
+	err := extractAt(src, FormatTar, []Member{{Name: "a", Path: filepath.Join(dir, "a")}, {Name: "b", Path: keep}}, ExtractOptions{})
+	if !errors.Is(err, fs.ErrExist) {
+		t.Fatalf("err = %v", err)
+	}
+	if readFile(t, keep) != "precious" {
+		t.Fatal("existing file changed")
+	}
+	if _, err := os.Lstat(filepath.Join(dir, "a")); err == nil {
+		t.Error("partial output left")
+	}
+}
+
+// TestExtractMultistreamGzip is a regression test: only the first member
+// of a concatenated gzip file was extracted, silently.
+func TestExtractMultistreamGzip(t *testing.T) {
+	dir := t.TempDir()
+	data := append(gzipOf(t, []byte("part1-")), gzipOf(t, []byte("part2"))...)
+	src := writeTemp(t, dir, "m.gz", data)
+	out := filepath.Join(dir, "out")
+	must(t, extractAt(src, FormatGzip, []Member{{Path: out}}, ExtractOptions{}))
+	if got := readFile(t, out); got != "part1-part2" {
+		t.Fatalf("got %q", got)
+	}
+	bad := writeTemp(t, dir, "bad.gz", append(gzipOf(t, []byte("x")), "junk"...))
+	if err := extractAt(bad, FormatGzip, []Member{{Path: filepath.Join(dir, "bad")}}, ExtractOptions{}); err == nil {
+		t.Error("trailing garbage accepted")
+	}
+}
+
+func TestExtractCancel(t *testing.T) {
+	dir := t.TempDir()
+	data := tarGz(t, true, tarEntry{name: "app", body: "x"})
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	err := Extract(ctx, bytes.NewReader(data), int64(len(data)), FormatTarGzip, []Member{{Name: "app", Path: filepath.Join(dir, "o")}}, ExtractOptions{})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v", err)
+	}
+	var last int64
+	must(t, Extract(t.Context(), bytes.NewReader(data), int64(len(data)), FormatTarGzip, []Member{{Name: "app", Path: filepath.Join(dir, "p")}},
+		ExtractOptions{Progress: func(done, total int64) { last = done }}))
+	if last <= 0 || last > int64(len(data)) {
+		t.Errorf("progress %d of %d", last, len(data))
+	}
 }
 
 func readFile(t testing.TB, p string) string {
@@ -73,7 +153,7 @@ func TestExtractMembers(t *testing.T) {
 	for format, data := range archives {
 		src := writeTemp(t, dir, "a."+format.String(), data)
 		out := filepath.Join(dir, "out-"+format.String())
-		if err := Extract(src, format, []Member{{Name: "bin/app", Path: out, Mode: 0o755}}, Limits{}); err != nil {
+		if err := extractAt(src, format, []Member{{Name: "bin/app", Path: out, Mode: 0o755}}, ExtractOptions{}); err != nil {
 			t.Fatalf("%v: %v", format, err)
 		}
 		if got := readFile(t, out); got != "APP" {
@@ -92,7 +172,7 @@ func TestExtractMembers(t *testing.T) {
 			"partial":   {{Name: "README", Path: out + ".r"}, {Name: "nope", Path: out + ".n"}},
 		}
 		for name, members := range fail {
-			if err := Extract(src, format, members, Limits{}); err == nil {
+			if err := extractAt(src, format, members, ExtractOptions{}); err == nil {
 				t.Errorf("%v %s: extracted", format, name)
 			}
 			for _, m := range members {
@@ -105,7 +185,7 @@ func TestExtractMembers(t *testing.T) {
 			t.Fatal("zip slip")
 		}
 		// Existing output is never overwritten.
-		if err := Extract(src, format, []Member{{Name: "bin/app", Path: out}}, Limits{}); !errors.Is(err, fs.ErrExist) {
+		if err := extractAt(src, format, []Member{{Name: "bin/app", Path: out}}, ExtractOptions{}); !errors.Is(err, fs.ErrExist) {
 			t.Errorf("%v: overwrote: %v", format, err)
 		}
 	}
@@ -114,7 +194,7 @@ func TestExtractMembers(t *testing.T) {
 func TestExtractDuplicate(t *testing.T) {
 	dir := t.TempDir()
 	src := writeTemp(t, dir, "dup.tar", tarGz(t, false, tarEntry{name: "app", body: "one"}, tarEntry{name: "./app", body: "two"}))
-	if err := Extract(src, FormatTar, []Member{{Name: "app", Path: filepath.Join(dir, "out")}}, Limits{}); !errors.Is(err, ErrUnsafeEntry) {
+	if err := extractAt(src, FormatTar, []Member{{Name: "app", Path: filepath.Join(dir, "out")}}, ExtractOptions{}); !errors.Is(err, ErrUnsafeEntry) {
 		t.Fatalf("duplicate: %v", err)
 	}
 }
@@ -122,17 +202,17 @@ func TestExtractDuplicate(t *testing.T) {
 func TestExtractSingleFile(t *testing.T) {
 	dir := t.TempDir()
 	src := writeTemp(t, dir, "f.gz", gzipOf(t, []byte("hello")))
-	if err := Extract(src, FormatGzip, []Member{{Path: filepath.Join(dir, "f")}}, Limits{}); err != nil || readFile(t, filepath.Join(dir, "f")) != "hello" {
+	if err := extractAt(src, FormatGzip, []Member{{Path: filepath.Join(dir, "f")}}, ExtractOptions{}); err != nil || readFile(t, filepath.Join(dir, "f")) != "hello" {
 		t.Fatalf("gzip: %v", err)
 	}
 	raw := writeTemp(t, dir, "raw", []byte("raw"))
-	if err := Extract(raw, FormatRaw, []Member{{Path: filepath.Join(dir, "r")}}, Limits{}); err != nil || readFile(t, filepath.Join(dir, "r")) != "raw" {
+	if err := extractAt(raw, FormatRaw, []Member{{Path: filepath.Join(dir, "r")}}, ExtractOptions{}); err != nil || readFile(t, filepath.Join(dir, "r")) != "raw" {
 		t.Fatalf("raw: %v", err)
 	}
-	if err := Extract(raw, FormatRaw, nil, Limits{}); err == nil {
+	if err := extractAt(raw, FormatRaw, nil, ExtractOptions{}); err == nil {
 		t.Error("raw without member")
 	}
-	if err := Extract(raw, FormatUnknown, []Member{{Path: filepath.Join(dir, "u")}}, Limits{}); err == nil {
+	if err := extractAt(raw, FormatUnknown, []Member{{Path: filepath.Join(dir, "u")}}, ExtractOptions{}); err == nil {
 		t.Error("unknown format")
 	}
 }
@@ -142,23 +222,23 @@ func TestExtractBombs(t *testing.T) {
 	big := strings.Repeat("A", 1<<20)
 	// A file over the per-file limit.
 	src := writeTemp(t, dir, "big.tar.gz", tarGz(t, true, tarEntry{name: "app", body: big}))
-	if err := Extract(src, FormatTarGzip, []Member{{Name: "app", Path: filepath.Join(dir, "o1")}}, Limits{MaxFileSize: 1000}); !errors.Is(err, ErrTooLarge) {
+	if err := extractAt(src, FormatTarGzip, []Member{{Name: "app", Path: filepath.Join(dir, "o1")}}, ExtractOptions{MaxFileSize: 1000}); !errors.Is(err, ErrTooLarge) {
 		t.Errorf("file limit: %v", err)
 	}
 	// Skipped entries still count towards the total.
 	src2 := writeTemp(t, dir, "skip.tar.gz", tarGz(t, true, tarEntry{name: "junk", body: big}, tarEntry{name: "app", body: "x"}))
-	if err := Extract(src2, FormatTarGzip, []Member{{Name: "app", Path: filepath.Join(dir, "o2")}}, Limits{MaxTotalSize: 1 << 16}); !errors.Is(err, ErrTooLarge) {
+	if err := extractAt(src2, FormatTarGzip, []Member{{Name: "app", Path: filepath.Join(dir, "o2")}}, ExtractOptions{MaxTotalSize: 1 << 16}); !errors.Is(err, ErrTooLarge) {
 		t.Errorf("total limit: %v", err)
 	}
 	zsrc := writeTemp(t, dir, "big.zip", zipOf(t, tarEntry{name: "junk", body: big}, tarEntry{name: "app", body: "x"}))
 	// Zip entries are read only when selected; then they count.
-	if err := Extract(zsrc, FormatZip, []Member{{Name: "app", Path: filepath.Join(dir, "o3")}}, Limits{MaxTotalSize: 1 << 16}); err != nil {
+	if err := extractAt(zsrc, FormatZip, []Member{{Name: "app", Path: filepath.Join(dir, "o3")}}, ExtractOptions{MaxTotalSize: 1 << 16}); err != nil {
 		t.Errorf("zip skipped entry counted: %v", err)
 	}
-	if err := ExtractDir(zsrc, FormatZip, "", filepath.Join(dir, "o3d"), Limits{MaxTotalSize: 1 << 16}); !errors.Is(err, ErrTooLarge) {
+	if err := extractDirAt(zsrc, FormatZip, "", filepath.Join(dir, "o3d"), ExtractOptions{MaxTotalSize: 1 << 16}); !errors.Is(err, ErrTooLarge) {
 		t.Errorf("zip total limit: %v", err)
 	}
-	if err := Extract(zsrc, FormatZip, []Member{{Name: "junk", Path: filepath.Join(dir, "o4")}}, Limits{MaxFileSize: 1 << 10}); !errors.Is(err, ErrTooLarge) {
+	if err := extractAt(zsrc, FormatZip, []Member{{Name: "junk", Path: filepath.Join(dir, "o4")}}, ExtractOptions{MaxFileSize: 1 << 10}); !errors.Is(err, ErrTooLarge) {
 		t.Errorf("zip file limit: %v", err)
 	}
 	many := make([]tarEntry, 20)
@@ -166,11 +246,11 @@ func TestExtractBombs(t *testing.T) {
 		many[i] = tarEntry{name: "f" + string(rune('a'+i))}
 	}
 	src3 := writeTemp(t, dir, "many.tar", tarGz(t, false, many...))
-	if err := Extract(src3, FormatTar, []Member{{Name: "zz", Path: filepath.Join(dir, "o5")}}, Limits{MaxEntries: 10}); !errors.Is(err, ErrTooLarge) {
+	if err := extractAt(src3, FormatTar, []Member{{Name: "zz", Path: filepath.Join(dir, "o5")}}, ExtractOptions{MaxEntries: 10}); !errors.Is(err, ErrTooLarge) {
 		t.Errorf("entry limit: %v", err)
 	}
 	gsrc := writeTemp(t, dir, "bomb.gz", gzipOf(t, bytes.Repeat([]byte{0}, 1<<20)))
-	if err := Extract(gsrc, FormatGzip, []Member{{Path: filepath.Join(dir, "o6")}}, Limits{MaxFileSize: 1 << 10}); !errors.Is(err, ErrTooLarge) {
+	if err := extractAt(gsrc, FormatGzip, []Member{{Path: filepath.Join(dir, "o6")}}, ExtractOptions{MaxFileSize: 1 << 10}); !errors.Is(err, ErrTooLarge) {
 		t.Errorf("gzip bomb: %v", err)
 	}
 }
@@ -192,7 +272,7 @@ func TestExtractDir(t *testing.T) {
 		}
 		src := writeTemp(t, dir, "good."+format.String(), data)
 		dst := filepath.Join(dir, "dst-"+format.String())
-		if err := ExtractDir(src, format, "pkg", dst, Limits{}); err != nil {
+		if err := extractDirAt(src, format, "pkg", dst, ExtractOptions{}); err != nil {
 			t.Fatalf("%v: %v", format, err)
 		}
 		if readFile(t, filepath.Join(dst, "a.dat")) != "a" || readFile(t, filepath.Join(dst, "sub", "b.dat")) != "b" {
@@ -201,8 +281,27 @@ func TestExtractDir(t *testing.T) {
 		if _, err := os.Stat(filepath.Join(dst, "c.dat")); err == nil {
 			t.Errorf("%v: extracted outside prefix", format)
 		}
-		if err := ExtractDir(src, format, "", dst, Limits{}); !errors.Is(err, fs.ErrExist) {
+		if err := extractDirAt(src, format, "", dst, ExtractOptions{}); !errors.Is(err, fs.ErrExist) {
 			t.Errorf("%v: reused destination: %v", format, err)
+		}
+	}
+	// A prefix with no files under it (a typo, a release missing the
+	// directory) must not install an empty directory.
+	for _, c := range []struct {
+		prefix  string
+		entries []tarEntry
+	}{
+		{"data", good},
+		{"pkg", []tarEntry{{name: "pkg/", typeflag: tar.TypeDir}}},
+		{"", []tarEntry{{name: "empty/", typeflag: tar.TypeDir}}},
+	} {
+		src := writeTemp(t, dir, "nofiles.tar", tarGz(t, false, c.entries...))
+		dst := filepath.Join(dir, "nofiles")
+		if err := extractDirAt(src, FormatTar, c.prefix, dst, ExtractOptions{}); !errors.Is(err, ErrMissingMember) {
+			t.Errorf("prefix %q: %v", c.prefix, err)
+		}
+		if _, err := os.Lstat(dst); err == nil {
+			t.Errorf("prefix %q: destination left", c.prefix)
 		}
 	}
 	attacks := map[string]tarEntry{
@@ -229,7 +328,7 @@ func TestExtractDir(t *testing.T) {
 			}
 			src := writeTemp(t, dir, name+"."+format.String(), data)
 			dst := filepath.Join(dir, "x-"+name+"-"+format.String())
-			if err := ExtractDir(src, format, "", dst, Limits{}); !errors.Is(err, ErrUnsafeEntry) {
+			if err := extractDirAt(src, format, "", dst, ExtractOptions{}); !errors.Is(err, ErrUnsafeEntry) {
 				t.Errorf("%s %v: err = %v", name, format, err)
 			}
 			if _, err := os.Lstat(dst); err == nil {
@@ -259,10 +358,10 @@ func FuzzExtractZip(f *testing.F) {
 func fuzzExtract(t *testing.T, data []byte, format Format) {
 	root := t.TempDir()
 	src := writeTemp(t, root, "in", data)
-	lim := Limits{MaxFileSize: 1 << 16, MaxTotalSize: 1 << 20, MaxEntries: 64}
-	_ = Extract(src, format, []Member{{Name: "app", Path: filepath.Join(root, "app")}}, lim)
+	lim := ExtractOptions{MaxFileSize: 1 << 16, MaxTotalSize: 1 << 20, MaxEntries: 64}
+	_ = extractAt(src, format, []Member{{Name: "app", Path: filepath.Join(root, "app")}}, lim)
 	dst := filepath.Join(root, "dst")
-	if ExtractDir(src, format, "", dst, lim) != nil {
+	if extractDirAt(src, format, "", dst, lim) != nil {
 		if _, err := os.Lstat(dst); err == nil {
 			t.Fatal("destination left after error")
 		}
@@ -302,7 +401,7 @@ func TestExtractDirModes(t *testing.T) {
 	must(t, tw.Close())
 	src := writeTemp(t, dir, "m.tar", buf.Bytes())
 	dst := filepath.Join(dir, "out")
-	must(t, ExtractDir(src, FormatTar, "", dst, Limits{}))
+	must(t, extractDirAt(src, FormatTar, "", dst, ExtractOptions{}))
 	for name, want := range map[string]fs.FileMode{"tool": 0o755, "data": 0o644} {
 		fi, err := os.Stat(filepath.Join(dst, name))
 		must(t, err)
@@ -311,7 +410,7 @@ func TestExtractDirModes(t *testing.T) {
 		}
 	}
 	gsrc := writeTemp(t, dir, "z.gz", gzipOf(t, bytes.Repeat([]byte{0}, 1<<16)))
-	if err := Extract(gsrc, FormatGzip, []Member{{Path: filepath.Join(dir, "g")}}, Limits{MaxTotalSize: 1 << 10}); !errors.Is(err, ErrTooLarge) {
+	if err := extractAt(gsrc, FormatGzip, []Member{{Path: filepath.Join(dir, "g")}}, ExtractOptions{MaxTotalSize: 1 << 10}); !errors.Is(err, ErrTooLarge) {
 		t.Errorf("gzip total: %v", err)
 	}
 }

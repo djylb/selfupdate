@@ -210,3 +210,48 @@ func TestPayloadStrict(t *testing.T) {
 		}
 	}
 }
+
+// TestManifestValidation covers manifests that used to be accepted:
+// closing brackets after the document (regression), no publication time,
+// ambiguous artifacts and versions, and a threshold no keys can meet.
+func TestManifestValidation(t *testing.T) {
+	k := newTestKey(t)
+	signed := mustSign(t, sampleManifest(), k)
+	for _, tail := range []string{"}", "]", " } "} {
+		if _, err := OpenManifest(append(bytes.Clone(signed), tail...), k.trust(), testNow); !errors.Is(err, ErrMalformedManifest) {
+			t.Errorf("trailing %q: %v", tail, err)
+		}
+	}
+	base, err := json.Marshal(sampleManifest())
+	must(t, err)
+	if _, err := DecodeManifest(append(base, ']')); !errors.Is(err, ErrMalformedManifest) {
+		t.Errorf("payload trailing bracket: %v", err)
+	}
+	app := artifactFor("app", "a", FormatRaw, []byte("x"))
+	linux := app
+	linux.OS = "linux"
+	for name, m := range map[string]*Manifest{
+		"no published":       {Product: "p", Expires: testNow},
+		"published late":     {Product: "p", Published: testNow, Expires: testNow},
+		"duplicate version":  manifestOf("p", Release{Version: "1.0.0"}, Release{Version: "1.0.0+build"}),
+		"duplicate artifact": manifestOf("p", Release{Version: "1.0.0", Artifacts: []Artifact{app, app}}),
+		"overlap":            manifestOf("p", Release{Version: "1.0.0", Artifacts: []Artifact{app, linux}}),
+	} {
+		if _, err := SignManifest(m, k.priv); !errors.Is(err, ErrMalformedManifest) {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	windows := linux
+	windows.OS = "windows"
+	if _, err := SignManifest(manifestOf("p", Release{Version: "1.0.0", Artifacts: []Artifact{linux, windows}}), k.priv); err != nil {
+		t.Errorf("distinct platforms: %v", err)
+	}
+	for name, trust := range map[string]Trust{
+		"threshold": {Keys: []TrustedKey{{Public: k.pub}, {Public: k.pub}}, Threshold: 2},
+		"bad key":   {Keys: []TrustedKey{{Public: k.pub[:5]}}},
+	} {
+		if _, err := OpenManifest(signed, trust, testNow); !errors.Is(err, ErrBadTrust) {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+}

@@ -8,113 +8,104 @@ import (
 	"fmt"
 	"hash"
 	"io"
-	"net/http"
 	"os"
-	"strconv"
-	"strings"
 )
 
-// ErrHTTPStatus reports an unexpected HTTP response status.
-var ErrHTTPStatus = errors.New("selfupdate: unexpected HTTP status")
-
-var errBadRange = errors.New("selfupdate: server cannot resume the download")
-
-// ProgressFunc observes a download. It is called on the downloading
-// goroutine, with no lock held, after each chunk; done counts bytes in the
-// file so far and total is the expected size. It must not block for long.
+// ProgressFunc observes a transfer. It is called on the working goroutine,
+// with no lock held, after each chunk; done counts bytes so far and total
+// is the expected size. It must not block for long.
 type ProgressFunc func(done, total int64)
 
-// Download fetches url into the file dst, which must hold exactly size
-// bytes when complete, and returns its digests. If dst already holds a
-// prefix of the content (an interrupted earlier call), that prefix is
-// hashed and the rest is requested with a Range header; a server that
-// ignores the range makes the download start over. A nil client means
-// [http.DefaultClient]; progress may be nil.
+// Download copies the artifact a from src into the file dst and checks it
+// against the size and digests the artifact pins. On success it returns
+// dst opened for reading, positioned at its start, so the verified content
+// is read through the same open file it was checked in; the caller closes
+// it. On a mismatch dst is truncated and [ErrDigestMismatch] is returned.
 //
-// Download does not judge the content: compare the digests with
-// [Artifact.Check] before using the file.
-func Download(ctx context.Context, client *http.Client, url, dst string, size int64, progress ProgressFunc) (Digests, error) {
-	if size <= 0 {
-		return Digests{}, errors.New("selfupdate: download size must be positive")
-	}
-	if client == nil {
-		client = http.DefaultClient
+// If dst already holds a prefix of the content (an interrupted earlier
+// call), only the rest is requested; a source that cannot resume starts
+// over, and so does a resumed file that turns out not to match. Only the
+// digests the artifact lists are computed. progress may be nil.
+func Download(ctx context.Context, src Source, a Artifact, dst string, progress ProgressFunc) (_ *os.File, err error) {
+	if err := a.validate(); err != nil {
+		return nil, err
 	}
 	f, err := os.OpenFile(dst, os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
-		return Digests{}, err
+		return nil, err
 	}
-	defer closeQuietly(f) // synced explicitly below
-	h := newHasher()
-	have, err := io.Copy(h, io.LimitReader(f, size+1))
+	defer func() {
+		if err != nil {
+			closeQuietly(f)
+		}
+	}()
+	h := newHasher(a)
+	have, err := io.Copy(h, io.LimitReader(f, a.Size+1))
 	if err != nil {
-		return Digests{}, err
+		return nil, err
 	}
-	if have > size {
+	if have > a.Size {
 		if err := restart(f, h); err != nil {
-			return Digests{}, err
+			return nil, err
 		}
 		have = 0
 	}
-	if have < size {
-		err := fetchRange(ctx, client, url, f, h, have, size, progress)
-		if errors.Is(err, errBadRange) {
-			// The server cannot continue this file: start over once.
-			if err = restart(f, h); err == nil {
-				err = fetchRange(ctx, client, url, f, h, 0, size, progress)
+	for resumed := have > 0; ; resumed = false {
+		if have < a.Size {
+			if err := fetch(ctx, src, a, f, h, have, progress); err != nil {
+				return nil, err
 			}
 		}
-		if err != nil {
-			return Digests{}, err
+		err := a.Check(a.Size, h.sum())
+		if err == nil {
+			break
 		}
+		if rerr := restart(f, h); rerr != nil {
+			return nil, errors.Join(err, rerr)
+		}
+		if !resumed {
+			return nil, err
+		}
+		have = 0 // the kept prefix was bad: start over once
 	}
 	if err := f.Sync(); err != nil {
-		return Digests{}, err
+		return nil, err
 	}
-	return h.sum(), nil
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return nil, err
+	}
+	return f, nil
 }
 
-func fetchRange(ctx context.Context, client *http.Client, url string, f *os.File, h *hasher, have, size int64, progress ProgressFunc) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+// fetch appends the artifact from offset have to f.
+func fetch(ctx context.Context, src Source, a Artifact, f *os.File, h *hasher, have int64, progress ProgressFunc) error {
+	r, start, err := src.Open(ctx, a, have)
 	if err != nil {
 		return err
 	}
-	if have > 0 {
-		req.Header.Set("Range", "bytes="+strconv.FormatInt(have, 10)+"-")
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer closeQuietly(resp.Body)
-	switch {
-	case have > 0 && (resp.StatusCode == http.StatusRequestedRangeNotSatisfiable ||
-		resp.StatusCode == http.StatusPartialContent && rangeStart(resp.Header.Get("Content-Range")) != have):
-		return errBadRange
-	case resp.StatusCode == http.StatusPartialContent && have > 0:
-	case resp.StatusCode == http.StatusOK:
-		if have > 0 {
-			if err := restart(f, h); err != nil {
-				return err
-			}
-			have = 0
+	defer closeQuietly(r)
+	switch start {
+	case have:
+	case 0:
+		if err := restart(f, h); err != nil {
+			return err
 		}
 	default:
-		return fmt.Errorf("%w: %s from %s", ErrHTTPStatus, resp.Status, req.URL.Redacted())
+		return fmt.Errorf("selfupdate: source resumed at %d, not %d or 0", start, have)
 	}
-	if _, err := f.Seek(have, io.SeekStart); err != nil {
+	if _, err := f.Seek(start, io.SeekStart); err != nil {
 		return err
 	}
-	w := &progressWriter{w: io.MultiWriter(f, h), done: have, total: size, fn: progress}
-	n, err := io.Copy(w, io.LimitReader(resp.Body, size-have+1))
+	w := &progressWriter{w: io.MultiWriter(f, h), done: start, total: a.Size, fn: progress}
+	n, err := io.Copy(w, io.LimitReader(r, a.Size-start+1))
 	if err != nil {
 		return err
 	}
-	switch got := have + n; {
-	case got > size:
-		return fmt.Errorf("%w: more than %d bytes", ErrTooLarge, size)
-	case got < size:
-		return fmt.Errorf("selfupdate: download ended after %d of %d bytes: %w", got, size, io.ErrUnexpectedEOF)
+	switch got := start + n; {
+	case got > a.Size:
+		return fmt.Errorf("%w: more than %d bytes", ErrTooLarge, a.Size)
+	case got < a.Size:
+		return fmt.Errorf("selfupdate: download ended after %d of %d bytes: %w", got, a.Size, io.ErrUnexpectedEOF)
 	}
 	return nil
 }
@@ -128,55 +119,62 @@ func restart(f *os.File, h *hasher) error {
 	return err
 }
 
-// rangeStart parses the first byte position of "bytes start-end/total".
-func rangeStart(s string) int64 {
-	rest, ok := strings.CutPrefix(s, "bytes ")
-	if !ok {
-		return -1
-	}
-	start, _, ok := strings.Cut(rest, "-")
-	if !ok {
-		return -1
-	}
-	n, err := strconv.ParseInt(start, 10, 64)
-	if err != nil {
-		return -1
-	}
-	return n
-}
-
+// hasher computes the digests an artifact lists, and only those.
 type hasher struct {
 	s256, s512 hash.Hash
 }
 
-func newHasher() *hasher { return &hasher{s256: sha256.New(), s512: sha512.New()} }
+func newHasher(a Artifact) *hasher {
+	h := &hasher{}
+	if a.SHA256 != "" {
+		h.s256 = sha256.New()
+	}
+	if a.SHA512 != "" {
+		h.s512 = sha512.New()
+	}
+	return h
+}
 
 func (h *hasher) Write(p []byte) (int, error) {
-	h.s256.Write(p)
-	h.s512.Write(p)
+	if h.s256 != nil {
+		h.s256.Write(p)
+	}
+	if h.s512 != nil {
+		h.s512.Write(p)
+	}
 	return len(p), nil
 }
 
 func (h *hasher) reset() {
-	h.s256.Reset()
-	h.s512.Reset()
+	if h.s256 != nil {
+		h.s256.Reset()
+	}
+	if h.s512 != nil {
+		h.s512.Reset()
+	}
 }
 
+// sum returns the digests computed; the others stay zero.
 func (h *hasher) sum() Digests {
 	var d Digests
-	h.s256.Sum(d.SHA256[:0])
-	h.s512.Sum(d.SHA512[:0])
+	if h.s256 != nil {
+		h.s256.Sum(d.SHA256[:0])
+	}
+	if h.s512 != nil {
+		h.s512.Sum(d.SHA512[:0])
+	}
 	return d
 }
 
-// DigestFile returns the size and digests of the file at p.
+// DigestFile returns the size and both digests of the file at p, as a
+// publisher needs them to describe an artifact.
 func DigestFile(p string) (int64, Digests, error) {
 	f, err := os.Open(p)
 	if err != nil {
 		return 0, Digests{}, err
 	}
 	defer closeQuietly(f)
-	h := newHasher()
+	h := &hasher{s256: sha256.New(), s512: sha512.New()}
 	n, err := io.Copy(h, f)
 	if err != nil {
 		return 0, Digests{}, err

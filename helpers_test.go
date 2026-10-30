@@ -5,6 +5,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"crypto/ed25519"
 	"encoding/hex"
 	"fmt"
@@ -27,7 +28,7 @@ func TestMain(m *testing.M) {
 	code := m.Run()
 	if code == 0 {
 		if leaked := settleGoroutines(); leaked != "" {
-			fmt.Fprintf(os.Stderr, "goroutine leak:\n%s\n", leaked)
+			_, _ = fmt.Fprintf(os.Stderr, "goroutine leak:\n%s\n", leaked)
 			code = 1
 		}
 	}
@@ -72,6 +73,9 @@ func gzipOf(t testing.TB, data []byte) []byte {
 	must(t, zw.Close())
 	return buf.Bytes()
 }
+
+// bg is the context of operations that need no deadline.
+var bg = context.Background()
 
 var testNow = time.Date(2030, 1, 2, 3, 4, 5, 0, time.UTC)
 

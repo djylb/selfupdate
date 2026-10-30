@@ -3,18 +3,19 @@
 //
 // The pieces fit together as a pipeline, and each can be used alone:
 //
-//   - a [Source] fetches a signed [Manifest]; [HTTPSource] reads one from a
-//     URL, and publishers produce it with [SignManifest];
+//   - a [Source] provides a signed [Manifest] and the artifacts it lists;
+//     [HTTPSource] reads them over HTTP, [DirSource] from a local
+//     directory, and publishers produce manifests with [SignManifest];
 //   - [OpenManifest] verifies Ed25519 signatures against a [Trust] policy
 //     with key IDs, several keys, thresholds and key expiry, and rejects
 //     expired manifests;
 //   - [Version] and [CompareVersions] order semantic versions;
-//   - [Download] fetches an artifact with resumption, a size bound and
-//     progress, hashing as it goes; [Artifact.Check] compares the digests;
+//   - [Download] fetches an artifact from a Source with resumption, a size
+//     bound and progress, and returns it verified against the manifest;
 //   - [Extract] and [ExtractDir] unpack raw, gzip, tar, tar.gz and zip
 //     files without letting entry names choose output paths;
-//   - a [Journal] swaps a set of files by rename, keeps backups, and
-//     commits or rolls back, also after a crash;
+//   - a [Journal] swaps a set of files and directories by rename, keeps
+//     backups, and commits or rolls back, also after a crash;
 //   - [Relaunch] restarts the program on the new code.
 //
 // [Updater] composes them. A program that updates itself calls
@@ -23,13 +24,13 @@
 //
 //	j, err := selfupdate.ExecutableJournal()
 //	...
-//	out, err := j.Startup(1)
+//	out, err := j.Startup(ctx, 1)
 //	switch out.Status {
 //	case selfupdate.StatusPending:
-//		// run a self-check, then j.Commit()
+//		// run a self-check, then j.Commit(ctx)
 //	case selfupdate.StatusRolledBack:
-//		// restart into the restored version
-//	case selfupdate.StatusIdle:
+//		// skip out.Version from now on; selfupdate.Relaunch("", nil)
+//	case selfupdate.StatusIdle, selfupdate.StatusInProgress, selfupdate.StatusCleanup:
 //	}
 //
 // Everything fails closed: unsigned or tampered manifests, artifacts

@@ -20,5 +20,8 @@
   every target in the CI cross-vet list must build.
 - The README, docs and commits name no other project and quote no benchmark
   numbers.
+- The `selfupdate_fcntl` build tag (tests only) selects the fcntl lock on
+  Linux and macOS; run the tests with it too, since fcntl is otherwise
+  used only on solaris and aix, where no tests run.
 - Commit subjects are short, English and imperative.
 - Never commit host names, IP addresses or credentials.

@@ -1,133 +1,184 @@
 package selfupdate
 
 import (
-	"crypto/rand"
-	"encoding/json"
+	"context"
 	"errors"
-	"io/fs"
+	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 )
 
-// owner identifies the process (and the call within it) holding a lock or
-// a staged update.
-type owner struct {
-	Token string `json:"token"`
-	PID   int    `json:"pid"`
-}
+// errLocked reports that a lock taken without waiting is held elsewhere.
+var errLocked = errors.New("selfupdate: lock is held")
 
-func newOwner() owner { return owner{Token: rand.Text(), PID: os.Getpid()} }
-
-// alive reports whether the owner may still be working. A process that
-// cannot be inspected counts as alive, so the lock fails closed.
-func (o owner) alive() bool { return o.PID == os.Getpid() || processAlive(o.PID) }
-
-// fileLock is a short-lived cross-process mutex: a file created
-// atomically with its owner inside. A lock whose owner process has died is
-// broken by the next caller.
+// fileLock is a mutex shared by the goroutines of this process and, where
+// the system has file locks, by all processes: flock or fcntl on Unix
+// systems and LockFileEx on Windows. The kernel drops the lock of a
+// process that dies, so no lock is ever stale. Within a process, locks
+// exclude each other by lock path and, through the system lock, by the
+// file itself, whatever path led to it.
+//
+// The lock file exists only while somebody uses it: its holder deletes it
+// before unlocking, and whoever locks a file that is no longer the one at
+// the path (it was deleted meanwhile) tries again.
 type fileLock struct {
-	path string
-	me   owner
+	local *localLock
+	f     *os.File // nil where the system has no file locks
+	path  string
 }
 
-// unownedGrace is how long a lock file without readable owner (possible
-// only where hard links are unsupported and the creator crashed between
-// creating and writing it) is respected.
-const unownedGrace = time.Minute
+// lockFile takes the lock at path, waiting until ctx ends.
+func lockFile(ctx context.Context, path string) (*fileLock, error) {
+	return takeLock(ctx, path, true)
+}
 
-func acquireLock(p string) (*fileLock, error) {
-	me := newOwner()
-	data, err := json.Marshal(me)
+// tryLockFile takes the lock at path or fails at once with errLocked.
+func tryLockFile(path string) (*fileLock, error) {
+	return takeLock(context.Background(), path, false)
+}
+
+func takeLock(ctx context.Context, path string, wait bool) (*fileLock, error) {
+	local, err := acquireLocal(ctx, lockKey(path), wait)
 	if err != nil {
 		return nil, err
 	}
-	for attempt := range 2 {
-		err := createExclusive(p, data)
-		if err == nil {
-			return &fileLock{path: p, me: me}, nil
+	f, err := acquireSystem(ctx, path, wait)
+	if err != nil {
+		local.release()
+		return nil, err
+	}
+	return &fileLock{local: local, f: f, path: path}, nil
+}
+
+// unlock deletes the lock file and releases the lock. A lock file that
+// cannot be deleted does no harm: the next holder reuses it.
+func (l *fileLock) unlock() {
+	if l.f != nil {
+		removeLocked(l.f, l.path)
+		unlockSystem(l.f)
+		closeLockFile(l.f)
+	}
+	l.local.release()
+}
+
+// acquireSystem takes the system lock on the file at path, polling while
+// another process holds it.
+func acquireSystem(ctx context.Context, path string, wait bool) (*os.File, error) {
+	delay := time.Millisecond
+	for {
+		f, err := openLockFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("selfupdate: lock: %w", err)
 		}
-		if !errors.Is(err, fs.ErrExist) {
-			return nil, err
+		if f == nil {
+			return nil, nil // no file locks here
 		}
-		if attempt == 1 || !breakStaleLock(p) {
-			break
+		ok, err := tryLockSystem(f)
+		switch {
+		case err != nil:
+			closeLockFile(f)
+			return nil, fmt.Errorf("selfupdate: lock %s: %w", path, err)
+		case ok && isCurrent(f, path):
+			return f, nil
+		case ok:
+			// Locked a file its holder deleted before unlocking: try the
+			// one at the path now.
+			unlockSystem(f)
+			closeLockFile(f)
+			continue
+		}
+		closeLockFile(f)
+		if !wait {
+			return nil, errLocked
+		}
+		t := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return nil, ctx.Err()
+		case <-t.C:
+		}
+		delay = min(2*delay, 50*time.Millisecond)
+	}
+}
+
+// isCurrent reports whether f is still the file at path.
+func isCurrent(f *os.File, path string) bool {
+	a, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	b, err := os.Stat(path)
+	return err == nil && os.SameFile(a, b)
+}
+
+// lockKey names the lock of path within this process.
+func lockKey(path string) string {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return path
+	}
+	if dir, err := filepath.EvalSymlinks(filepath.Dir(abs)); err == nil {
+		return filepath.Join(dir, filepath.Base(abs))
+	}
+	return abs
+}
+
+// localLock serializes the goroutines of this process on one lock path.
+// Entries live only while somebody holds or waits for them.
+type localLock struct {
+	ch   chan struct{}
+	key  string
+	refs int
+}
+
+var localLocks = struct {
+	m map[string]*localLock
+	sync.Mutex
+}{m: map[string]*localLock{}}
+
+func acquireLocal(ctx context.Context, key string, wait bool) (*localLock, error) {
+	localLocks.Lock()
+	l := localLocks.m[key]
+	if l == nil {
+		l = &localLock{ch: make(chan struct{}, 1), key: key}
+		localLocks.m[key] = l
+	}
+	l.refs++
+	localLocks.Unlock()
+	if !wait {
+		select {
+		case l.ch <- struct{}{}:
+			return l, nil
+		default:
+			l.drop()
+			return nil, errLocked
 		}
 	}
-	return nil, ErrBusy
+	if err := ctx.Err(); err != nil {
+		l.drop()
+		return nil, err
+	}
+	select {
+	case l.ch <- struct{}{}:
+		return l, nil
+	case <-ctx.Done():
+		l.drop()
+		return nil, ctx.Err()
+	}
 }
 
-// createExclusive creates p holding data, failing with fs.ErrExist if p
-// exists. The content is complete before p appears where hard links work.
-func createExclusive(p string, data []byte) error {
-	tmp := p + ".tmp-" + rand.Text()[:12]
-	if err := writeSynced(tmp, data, os.O_EXCL); err != nil {
-		return err
-	}
-	err := os.Link(tmp, p)
-	_ = os.Remove(tmp)
-	if err != nil && !errors.Is(err, fs.ErrExist) {
-		// No hard links on this file system: create in place.
-		err = writeSynced(p, data, os.O_EXCL)
-	}
-	if err != nil {
-		return err
-	}
-	return syncDir(filepath.Dir(p))
+func (l *localLock) release() {
+	<-l.ch
+	l.drop()
 }
 
-func readOwner(p string) (owner, fs.FileInfo, error) {
-	fi, err := os.Stat(p)
-	if err != nil {
-		return owner{}, nil, err
+func (l *localLock) drop() {
+	localLocks.Lock()
+	defer localLocks.Unlock()
+	if l.refs--; l.refs == 0 {
+		delete(localLocks.m, l.key)
 	}
-	data, err := os.ReadFile(p)
-	if err != nil {
-		return owner{}, fi, err
-	}
-	var o owner
-	if json.Unmarshal(data, &o) != nil || o.Token == "" {
-		return owner{}, fi, nil
-	}
-	return o, fi, nil
-}
-
-// breakStaleLock removes the lock at p if its owner is gone and reports
-// whether it did.
-func breakStaleLock(p string) bool {
-	o, fi, err := readOwner(p)
-	switch {
-	case errors.Is(err, fs.ErrNotExist):
-		return true // released meanwhile
-	case err != nil:
-		return false
-	case o.Token == "" && time.Since(fi.ModTime()) < unownedGrace:
-		return false
-	case o.Token != "" && o.alive():
-		return false
-	}
-	// Move it aside first, then check that what was moved is the stale
-	// lock and not one taken meanwhile by somebody else.
-	aside := p + ".stale-" + rand.Text()[:12]
-	if os.Rename(p, aside) != nil {
-		return false
-	}
-	moved, _, err := readOwner(aside)
-	if err != nil || moved != o {
-		_ = os.Link(aside, p) // put the fresh lock back
-		_ = os.Remove(aside)
-		return false
-	}
-	return os.Remove(aside) == nil
-}
-
-func (l *fileLock) release() error {
-	o, _, err := readOwner(l.path)
-	if err != nil {
-		return err
-	}
-	if o != l.me {
-		return errors.New("selfupdate: lock was broken by another process")
-	}
-	return removeIfExists(l.path)
 }

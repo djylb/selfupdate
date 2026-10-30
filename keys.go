@@ -27,6 +27,7 @@ var (
 	ErrNoTrustedKeys = errors.New("selfupdate: no trusted keys configured")
 	ErrUnsigned      = errors.New("selfupdate: not signed by enough trusted keys")
 	ErrInvalidKey    = errors.New("selfupdate: invalid key")
+	ErrBadTrust      = errors.New("selfupdate: invalid trust policy")
 )
 
 // Signature is one Ed25519 signature together with the ID of the key that
@@ -57,7 +58,8 @@ type Trust struct {
 	// Keys lists the trusted public keys.
 	Keys []TrustedKey
 	// Threshold is the number of distinct trusted keys that must have
-	// signed. Zero means one.
+	// signed. Zero means one. A threshold above the number of distinct
+	// keys, or a malformed key, is reported as [ErrBadTrust].
 	Threshold int
 	// InsecureSkipSignature turns signature checks off. Content is then
 	// only as trustworthy as the channel it was fetched over; digests are
@@ -90,7 +92,7 @@ func ParsePublicKey(s string) (ed25519.PublicKey, error) {
 	if err != nil {
 		return nil, err
 	}
-	return ed25519.PublicKey(b), nil
+	return b, nil
 }
 
 // FormatPrivateKey encodes the seed of priv as "ed25519-seed:" followed by
@@ -147,6 +149,18 @@ func (t Trust) verify(context string, msg []byte, sigs []Signature, now time.Tim
 		return nil, ErrNoTrustedKeys
 	}
 	need := max(t.Threshold, 1)
+	var distinct []string
+	for _, k := range t.Keys {
+		if len(k.Public) != ed25519.PublicKeySize {
+			return nil, fmt.Errorf("%w: key of %d bytes", ErrBadTrust, len(k.Public))
+		}
+		if id := KeyID(k.Public); !slices.Contains(distinct, id) {
+			distinct = append(distinct, id)
+		}
+	}
+	if need > len(distinct) {
+		return nil, fmt.Errorf("%w: threshold %d exceeds the %d distinct trusted keys", ErrBadTrust, need, len(distinct))
+	}
 	data := append([]byte(context), msg...)
 	var ok []string
 	for _, s := range sigs {
@@ -154,7 +168,7 @@ func (t Trust) verify(context string, msg []byte, sigs []Signature, now time.Tim
 			continue
 		}
 		for _, k := range t.Keys {
-			if len(k.Public) != ed25519.PublicKeySize || KeyID(k.Public) != s.KeyID {
+			if KeyID(k.Public) != s.KeyID {
 				continue
 			}
 			if !k.NotAfter.IsZero() && now.After(k.NotAfter) {

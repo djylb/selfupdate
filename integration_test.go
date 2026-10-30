@@ -52,15 +52,20 @@ func helperVersion(exe string) (string, error) {
 // public-key [report-file]].
 func helperMain(args []string) int {
 	if err := helperRun(args); err != nil {
-		fmt.Fprintln(os.Stderr, "helper:", err)
+		_, _ = fmt.Fprintln(os.Stderr, "helper:", err) // exiting with status 1 anyway
 		return 1
 	}
 	return 0
 }
 
 func helperRun(args []string) error {
-	if args[0] == "crash" {
+	switch args[0] {
+	case "crash":
 		return helperCrash(args[1:])
+	case "hold":
+		return helperHold(args[1])
+	case "trylock":
+		return helperTryLock(args[1])
 	}
 	exe, err := executable("")
 	if err != nil {
@@ -71,7 +76,7 @@ func helperRun(args []string) error {
 		return err
 	}
 	j := JournalFor(exe)
-	out, err := j.Startup(1)
+	out, err := j.Startup(bg, 1)
 	if err != nil {
 		return err
 	}
@@ -80,14 +85,14 @@ func helperRun(args []string) error {
 	case "version":
 	case "commit":
 		if out.Status == StatusPending {
-			if err := j.Commit(); err != nil {
+			if err := j.Commit(bg); err != nil {
 				return err
 			}
 			report += " committed"
 		}
 	case "report":
 		if out.Status == StatusPending {
-			if err := j.Commit(); err != nil {
+			if err := j.Commit(bg); err != nil {
 				return err
 			}
 			report += " committed"
@@ -149,7 +154,7 @@ func TestSelfReplaceIntegration(t *testing.T) {
 	if err := os.WriteFile(app, build("1.0.0"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	fs := newFileServer(t)
+	srv := newFileServer(t)
 	key := newTestKey(t)
 	publish := func(version string, format Format) {
 		data := build(version)
@@ -157,14 +162,14 @@ func TestSelfReplaceIntegration(t *testing.T) {
 			data = tarGz(t, true, tarEntry{name: "README", body: "notes"}, tarEntry{name: name, body: string(data)})
 		}
 		file := "helper-" + version + "." + format.String()
-		fs.put(file, data)
+		srv.put(file, data)
 		a := artifactFor("helper", file, format, data)
 		a.OS, a.Arch = runtime.GOOS, runtime.GOARCH
 		m := &Manifest{Product: "helper", Published: time.Now(), Expires: time.Now().Add(time.Hour),
 			Releases: []Release{{Version: version, Artifacts: []Artifact{a}}}}
-		fs.put("manifest.json", mustSign(t, m, key))
+		srv.put("manifest.json", mustSign(t, m, key))
 	}
-	manifestURL := fs.srv.URL + "/manifest.json"
+	manifestURL := srv.srv.URL + "/manifest.json"
 	pub := FormatPublicKey(key.pub)
 	run := func(args ...string) string {
 		t.Helper()
@@ -260,7 +265,7 @@ func helperCrash(args []string) error {
 	j := JournalFor(a)
 	switch op {
 	case "replace", "install":
-		s, err := j.Stage(a, b)
+		s, err := j.Stage(bg, a, b)
 		if err != nil {
 			return err
 		}
@@ -269,11 +274,22 @@ func helperCrash(args []string) error {
 				return err
 			}
 		}
-		return s.Replace(ReplaceOptions{Pending: op == "replace"})
+		return s.Replace(bg, ReplaceOptions{Pending: op == "replace"})
+	case "stage-exit":
+		s, err := j.Stage(bg, a, b)
+		if err != nil {
+			return err
+		}
+		for _, p := range s.Paths() {
+			if err := os.WriteFile(p, []byte("new"), 0o644); err != nil {
+				return err
+			}
+		}
+		os.Exit(crashExit) // dies holding the staging
 	case "commit":
-		return j.Commit()
+		return j.Commit(bg)
 	case "rollback":
-		return j.Rollback()
+		return j.Rollback(bg)
 	}
 	return fmt.Errorf("unknown op %q", op)
 }
@@ -298,7 +314,7 @@ func TestCrashInjection(t *testing.T) {
 			// b is new in the update: the old set has only a.
 			j := JournalFor(a)
 			if op == "commit" || op == "rollback" {
-				must(t, j.Replace([]Replacement{stage(t, a, "new"), stage(t, b, "new")}, ReplaceOptions{Pending: true}))
+				must(t, j.Replace(bg, []Replacement{stage(t, a, "new"), stage(t, b, "new")}, ReplaceOptions{Pending: true}))
 			}
 			ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
 			cmd := exec.CommandContext(ctx, self, "crash", dir, op, strconv.Itoa(n))
@@ -310,7 +326,7 @@ func TestCrashInjection(t *testing.T) {
 			if err != nil && !crashed {
 				t.Fatalf("%s step %d: %v\n%s", op, n, err, out)
 			}
-			res, err := j.Startup(1)
+			res, err := j.Startup(bg, 1)
 			if err != nil {
 				t.Fatalf("%s step %d: startup: %v", op, n, err)
 			}

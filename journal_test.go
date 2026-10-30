@@ -3,13 +3,12 @@ package selfupdate
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"slices"
 	"testing"
-	"time"
 )
 
 func stage(t testing.TB, target, content string) Replacement {
@@ -42,7 +41,7 @@ func TestJournalCommit(t *testing.T) {
 	}
 	j := JournalFor(app)
 	set := []Replacement{stage(t, app, "new app"), stage(t, lib, "new lib")}
-	if err := j.Replace(set, ReplaceOptions{Version: "2", Previous: "1", Pending: true}); err != nil {
+	if err := j.Replace(bg, set, ReplaceOptions{Version: "2", Previous: "1", Pending: true}); err != nil {
 		t.Fatal(err)
 	}
 	if readFile(t, app) != "new app" || readFile(t, lib) != "new lib" {
@@ -52,21 +51,21 @@ func TestJournalCommit(t *testing.T) {
 		t.Errorf("mode not kept: %v %v", fi, err)
 	}
 	third := stage(t, app, "third")
-	if err := j.Replace([]Replacement{third}, ReplaceOptions{}); !errors.Is(err, ErrBusy) {
+	if err := j.Replace(bg, []Replacement{third}, ReplaceOptions{}); !errors.Is(err, ErrBusy) {
 		t.Fatalf("second update: %v", err)
 	}
 	must(t, os.Remove(third.Staged))
-	out, err := j.Startup(1)
+	out, err := j.Startup(bg, 1)
 	if err != nil || out.Status != StatusPending || out.Version != "2" || out.Previous != "1" {
 		t.Fatalf("startup: %+v %v", out, err)
 	}
-	if err := j.Commit(); err != nil {
+	if err := j.Commit(bg); err != nil {
 		t.Fatal(err)
 	}
-	if err := j.Commit(); !errors.Is(err, ErrNotPending) {
+	if err := j.Commit(bg); !errors.Is(err, ErrNotPending) {
 		t.Errorf("second commit: %v", err)
 	}
-	if out, err := j.Startup(1); err != nil || out.Status != StatusIdle {
+	if out, err := j.Startup(bg, 1); err != nil || out.Status != StatusIdle {
 		t.Fatalf("after commit: %+v %v", out, err)
 	}
 	if got := listDir(t, dir); !slices.Equal(got, []string{"app", "lib.dat"}) {
@@ -79,15 +78,15 @@ func TestJournalRollbackAfterBoots(t *testing.T) {
 	app, lib := filepath.Join(dir, "app"), filepath.Join(dir, "lib.dat")
 	must(t, os.WriteFile(app, []byte("old app"), 0o755))
 	j := JournalFor(app)
-	if err := j.Replace([]Replacement{stage(t, app, "new app"), stage(t, lib, "new lib")}, ReplaceOptions{Pending: true}); err != nil {
+	if err := j.Replace(bg, []Replacement{stage(t, app, "new app"), stage(t, lib, "new lib")}, ReplaceOptions{Pending: true}); err != nil {
 		t.Fatal(err)
 	}
 	for boot := 1; boot <= 2; boot++ {
-		if out, err := j.Startup(2); err != nil || out.Status != StatusPending {
+		if out, err := j.Startup(bg, 2); err != nil || out.Status != StatusPending {
 			t.Fatalf("boot %d: %+v %v", boot, out, err)
 		}
 	}
-	out, err := j.Startup(2)
+	out, err := j.Startup(bg, 2)
 	if err != nil || out.Status != StatusRolledBack {
 		t.Fatalf("third boot: %+v %v", out, err)
 	}
@@ -100,7 +99,7 @@ func TestJournalRollbackAfterBoots(t *testing.T) {
 	if got := listDir(t, dir); !slices.Equal(got, []string{"app"}) {
 		t.Errorf("dir after rollback: %v", got)
 	}
-	if err := j.Rollback(); !errors.Is(err, ErrNotPending) {
+	if err := j.Rollback(bg); !errors.Is(err, ErrNotPending) {
 		t.Errorf("rollback without update: %v", err)
 	}
 }
@@ -110,10 +109,10 @@ func TestJournalExplicitRollback(t *testing.T) {
 	app := filepath.Join(dir, "app")
 	must(t, os.WriteFile(app, []byte("old"), 0o755))
 	j := JournalFor(app)
-	if err := j.Replace([]Replacement{stage(t, app, "new")}, ReplaceOptions{Pending: true}); err != nil {
+	if err := j.Replace(bg, []Replacement{stage(t, app, "new")}, ReplaceOptions{Pending: true}); err != nil {
 		t.Fatal(err)
 	}
-	if err := j.Rollback(); err != nil {
+	if err := j.Rollback(bg); err != nil {
 		t.Fatal(err)
 	}
 	if readFile(t, app) != "old" || !slices.Equal(listDir(t, dir), []string{"app"}) {
@@ -126,13 +125,13 @@ func TestJournalImmediate(t *testing.T) {
 	db := filepath.Join(dir, "rules.db")
 	must(t, os.WriteFile(db, []byte("v1"), 0o600))
 	j := JournalFor(db)
-	if err := j.Replace([]Replacement{stage(t, db, "v2")}, ReplaceOptions{}); err != nil {
+	if err := j.Replace(bg, []Replacement{stage(t, db, "v2")}, ReplaceOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	if readFile(t, db) != "v2" || !slices.Equal(listDir(t, dir), []string{"rules.db"}) {
 		t.Fatalf("immediate: %v", listDir(t, dir))
 	}
-	if err := j.Commit(); !errors.Is(err, ErrNotPending) {
+	if err := j.Commit(bg); !errors.Is(err, ErrNotPending) {
 		t.Errorf("commit: %v", err)
 	}
 }
@@ -163,7 +162,7 @@ func TestJournalCrashRecovery(t *testing.T) {
 		for _, s := range steps[:crash] {
 			s()
 		}
-		out, err := j.Startup(1)
+		out, err := j.Startup(bg, 1)
 		if err != nil || out.Status != StatusRolledBack {
 			t.Fatalf("crash %d: %+v %v", crash, out, err)
 		}
@@ -180,11 +179,11 @@ func TestJournalCrashRecovery(t *testing.T) {
 	j := JournalFor(filepath.Join(dir, "x"))
 	for _, bad := range []string{"", "\x00\x00", "{bad", "{}"} {
 		must(t, os.WriteFile(j.Path, []byte(bad), 0o600))
-		if _, err := j.Startup(1); !errors.Is(err, ErrCorruptJournal) {
+		if _, err := j.Startup(bg, 1); !errors.Is(err, ErrCorruptJournal) {
 			t.Fatalf("corrupt journal %q: %v", bad, err)
 		}
 	}
-	if err := j.Replace([]Replacement{stage(t, filepath.Join(dir, "x"), "n")}, ReplaceOptions{}); err == nil {
+	if err := j.Replace(bg, []Replacement{stage(t, filepath.Join(dir, "x"), "n")}, ReplaceOptions{}); err == nil {
 		t.Fatal("update over corrupt journal")
 	}
 }
@@ -198,7 +197,7 @@ func TestJournalCleanup(t *testing.T) {
 	must(t, err)
 	must(t, os.WriteFile(j.Path, data, 0o600))
 	// A new update finishes the cleanup first.
-	if err := j.Replace([]Replacement{stage(t, filepath.Join(dir, "x"), "n")}, ReplaceOptions{}); err != nil {
+	if err := j.Replace(bg, []Replacement{stage(t, filepath.Join(dir, "x"), "n")}, ReplaceOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	if got := listDir(t, dir); !slices.Equal(got, []string{"x"}) {
@@ -220,7 +219,7 @@ func TestReplaceValidates(t *testing.T) {
 		"not regular": {stage(t, dir, "d")},
 	}
 	for name, set := range cases {
-		if err := j.Replace(set, ReplaceOptions{}); err == nil {
+		if err := j.Replace(bg, set, ReplaceOptions{}); err == nil {
 			t.Errorf("%s: accepted", name)
 		}
 		if _, err := os.Lstat(j.Path); err == nil {
@@ -230,7 +229,7 @@ func TestReplaceValidates(t *testing.T) {
 }
 
 func TestStatusString(t *testing.T) {
-	for s, want := range map[Status]string{StatusIdle: "idle", StatusPending: "pending", StatusRolledBack: "rolled back", Status(9): "Status(9)"} {
+	for s, want := range map[Status]string{StatusIdle: "idle", StatusPending: "pending", StatusRolledBack: "rolled back", StatusInProgress: "in progress", StatusCleanup: "cleaning up", Status(9): "Status(9)"} {
 		if s.String() != want {
 			t.Errorf("%d: %s", int(s), s)
 		}
@@ -247,15 +246,15 @@ func TestRestoreIdempotent(t *testing.T) {
 	must(t, os.WriteFile(a, []byte("oldA"), 0o644))
 	must(t, os.WriteFile(b, []byte("oldB"), 0o644))
 	j := JournalFor(a)
-	must(t, j.Replace([]Replacement{stage(t, a, "newA"), stage(t, b, "newB")}, ReplaceOptions{Pending: true}))
+	must(t, j.Replace(bg, []Replacement{stage(t, a, "newA"), stage(t, b, "newB")}, ReplaceOptions{Pending: true}))
 	// Restoring b (done first) fails while its backup is unavailable.
 	must(t, os.Rename(b+backupSuffix, b+".hidden"))
-	if err := j.Rollback(); err == nil {
+	if err := j.Rollback(bg); err == nil {
 		t.Fatal("rollback without backup succeeded")
 	}
 	must(t, os.Rename(b+".hidden", b+backupSuffix))
 	for range 2 { // a retry, then a later start, must both be harmless
-		if _, err := j.Startup(1); err != nil {
+		if _, err := j.Startup(bg, 1); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -274,65 +273,17 @@ func TestPrepareTouchesNothing(t *testing.T) {
 	a := filepath.Join(dir, "a")
 	must(t, os.WriteFile(a, []byte("old"), 0o644))
 	j := JournalFor(a)
-	must(t, j.Replace([]Replacement{stage(t, a, "v1")}, ReplaceOptions{Pending: true}))
+	must(t, j.Replace(bg, []Replacement{stage(t, a, "v1")}, ReplaceOptions{Pending: true}))
 	if _, err := newJournalFile(a, stage(t, a, "v2").Staged); err != nil {
 		t.Fatal(err)
 	}
-	if err := j.Replace([]Replacement{stage(t, a, "v3")}, ReplaceOptions{}); !errors.Is(err, ErrBusy) {
+	if err := j.Replace(bg, []Replacement{stage(t, a, "v3")}, ReplaceOptions{}); !errors.Is(err, ErrBusy) {
 		t.Fatalf("second update: %v", err)
 	}
-	must(t, j.Rollback())
+	must(t, j.Rollback(bg))
 	if readFile(t, a) != "old" {
 		t.Fatal("original lost")
 	}
-}
-
-func TestJournalLock(t *testing.T) {
-	dir := t.TempDir()
-	a := filepath.Join(dir, "a")
-	must(t, os.WriteFile(a, []byte("old"), 0o644))
-	j := JournalFor(a)
-	l, err := acquireLock(j.Path + ".lock")
-	must(t, err)
-	if _, err := j.Startup(1); !errors.Is(err, ErrBusy) {
-		t.Errorf("startup under lock: %v", err)
-	}
-	if err := j.Replace([]Replacement{stage(t, a, "n")}, ReplaceOptions{}); !errors.Is(err, ErrBusy) {
-		t.Errorf("replace under lock: %v", err)
-	}
-	must(t, l.release())
-	// A lock left by a dead process is broken.
-	dead, err := json.Marshal(owner{Token: "x", PID: deadPID(t)})
-	must(t, err)
-	must(t, os.WriteFile(j.Path+".lock", dead, 0o600))
-	if out, err := j.Startup(1); err != nil || out.Status != StatusIdle {
-		t.Fatalf("stale lock: %+v %v", out, err)
-	}
-	// An unreadable lock is respected for a while.
-	must(t, os.WriteFile(j.Path+".lock", nil, 0o600))
-	if _, err := j.Recover(); !errors.Is(err, ErrBusy) {
-		t.Errorf("fresh unowned lock: %v", err)
-	}
-	old := time.Now().Add(-2 * unownedGrace)
-	must(t, os.Chtimes(j.Path+".lock", old, old))
-	if _, err := j.Recover(); err != nil {
-		t.Errorf("old unowned lock: %v", err)
-	}
-}
-
-// deadPID returns the ID of a process that has exited, or a value no
-// process has where processes cannot be started.
-func deadPID(t *testing.T) int {
-	t.Helper()
-	switch runtime.GOOS {
-	case "js", "wasip1", "plan9", "ios", "android":
-		return os.Getpid() + 1
-	}
-	self, err := os.Executable()
-	must(t, err)
-	cmd := exec.Command(self, "-test.run=^$")
-	must(t, cmd.Run())
-	return cmd.Process.Pid
 }
 
 func TestRecoverDoesNotCountBoots(t *testing.T) {
@@ -340,68 +291,16 @@ func TestRecoverDoesNotCountBoots(t *testing.T) {
 	a := filepath.Join(dir, "a")
 	must(t, os.WriteFile(a, []byte("old"), 0o644))
 	j := JournalFor(a)
-	must(t, j.Replace([]Replacement{stage(t, a, "new")}, ReplaceOptions{Pending: true}))
+	must(t, j.Replace(bg, []Replacement{stage(t, a, "new")}, ReplaceOptions{Pending: true}))
 	for range 3 {
-		if out, err := j.Recover(); err != nil || out.Status != StatusPending || out.Boots != 0 {
+		if out, err := j.Recover(bg); err != nil || out.Status != StatusPending || out.Boots != 0 {
 			t.Fatalf("recover: %+v %v", out, err)
 		}
 	}
-	if out, err := j.Startup(1); err != nil || out.Status != StatusPending || out.Boots != 1 {
+	if out, err := j.Startup(bg, 1); err != nil || out.Status != StatusPending || out.Boots != 1 {
 		t.Fatalf("startup: %+v %v", out, err)
 	}
-	must(t, j.Commit())
-}
-
-func TestStagedRecovery(t *testing.T) {
-	dir := t.TempDir()
-	a, b := filepath.Join(dir, "a"), filepath.Join(dir, "b")
-	must(t, os.WriteFile(a, []byte("old"), 0o644))
-	j := JournalFor(a)
-	s, err := j.Stage(a, b)
-	must(t, err)
-	for _, p := range s.Paths() {
-		must(t, os.WriteFile(p, []byte("new"), 0o644))
-	}
-	// The stager is alive (this process): others wait.
-	if _, err := j.Recover(); !errors.Is(err, ErrBusy) {
-		t.Fatalf("recover while staging: %v", err)
-	}
-	if _, err := j.Stage(a); !errors.Is(err, ErrBusy) {
-		t.Fatalf("second stage: %v", err)
-	}
-	must(t, s.Abort())
-	if got := listDir(t, dir); !slices.Equal(got, []string{"a"}) {
-		t.Fatalf("after abort: %v", got)
-	}
-	// A stager that died leaves files that the next start deletes.
-	s, err = j.Stage(a, b)
-	must(t, err)
-	for _, p := range s.Paths() {
-		must(t, os.WriteFile(p, []byte("new"), 0o644))
-	}
-	st, _, err := j.load()
-	must(t, err)
-	st.Owner.PID = deadPID(t)
-	must(t, j.save(&st))
-	if out, err := j.Startup(1); err != nil || out.Status != StatusIdle {
-		t.Fatalf("dead stager: %+v %v", out, err)
-	}
-	if got := listDir(t, dir); !slices.Equal(got, []string{"a"}) {
-		t.Fatalf("after recovery: %v", got)
-	}
-	if err := s.Replace(ReplaceOptions{}); err == nil {
-		t.Fatal("replaced a staging taken over")
-	}
-	// The normal path.
-	s, err = j.Stage(a, b)
-	must(t, err)
-	for _, p := range s.Paths() {
-		must(t, os.WriteFile(p, []byte("new"), 0o644))
-	}
-	must(t, s.Replace(ReplaceOptions{}))
-	if readFile(t, a) != "new" || readFile(t, b) != "new" || !slices.Equal(listDir(t, dir), []string{"a", "b"}) {
-		t.Fatalf("staged replace: %v", listDir(t, dir))
-	}
+	must(t, j.Commit(bg))
 }
 
 // TestRestoreRefusesAmbiguity leaves a file at the trash path of a swapped
@@ -411,14 +310,115 @@ func TestRestoreRefusesAmbiguity(t *testing.T) {
 	a := filepath.Join(dir, "a")
 	must(t, os.WriteFile(a, []byte("old"), 0o644))
 	j := JournalFor(a)
-	must(t, j.Replace([]Replacement{stage(t, a, "new")}, ReplaceOptions{Pending: true}))
+	must(t, j.Replace(bg, []Replacement{stage(t, a, "new")}, ReplaceOptions{Pending: true}))
 	st, _, err := j.load()
 	must(t, err)
 	must(t, os.WriteFile(st.Files[0].Trash, []byte("?"), 0o644))
-	if err := j.Rollback(); err == nil {
+	if err := j.Rollback(bg); err == nil {
 		t.Fatal("ambiguous rollback went ahead")
 	}
 	if readFile(t, a) != "new" || readFile(t, a+backupSuffix) != "old" {
 		t.Fatal("files touched")
+	}
+}
+
+// errInjected is the failure injected by tests.
+var errInjected = errors.New("injected failure")
+
+// crash is the panic value of a simulated crash.
+type crash struct{}
+
+// TestRollbackFailureInjection is a regression test: a rollback that
+// failed after restoring a target that was never swapped deleted its
+// staged copy, and every later recovery then took the target for one
+// whose backup was lost. An update of three files fails while swapping
+// the last one; then every rename of the rollback fails, or the process
+// crashes after every durable step, once each. Recovery must always end
+// with the old files and nothing else.
+func TestRollbackFailureInjection(t *testing.T) {
+	t.Cleanup(func() { testHookStep, testHookRename = nil, nil })
+	// run reports whether the failure was injected, that is, whether the
+	// rollback took that many renames or steps.
+	run := func(t *testing.T, failRename, crashStep int) (injected bool) {
+		dir := t.TempDir()
+		names := []string{"a", "b", "c"}
+		var set []Replacement
+		for _, n := range names {
+			p := filepath.Join(dir, n)
+			must(t, os.WriteFile(p, []byte("old "+n), 0o644))
+			set = append(set, stage(t, p, "new "+n))
+		}
+		j := JournalFor(set[0].Target)
+		renames, steps := 0, 0
+		swapping := true
+		testHookRename = func(from, to string) error {
+			if swapping && from == set[2].Staged {
+				swapping = false // c's swap fails: the rollback starts
+				return errInjected
+			}
+			if !swapping {
+				if renames++; renames == failRename {
+					injected = true
+					return errInjected
+				}
+			}
+			return nil
+		}
+		testHookStep = func(string) {
+			if !swapping {
+				if steps++; steps == crashStep {
+					injected = true
+					panic(crash{})
+				}
+			}
+		}
+		func() {
+			defer func() {
+				if r := recover(); r != nil && r != (crash{}) {
+					panic(r)
+				}
+			}()
+			if err := j.Replace(bg, set, ReplaceOptions{Pending: true}); err == nil {
+				t.Fatal("replace succeeded")
+			}
+		}()
+		testHookStep, testHookRename = nil, nil
+		if _, err := j.Startup(bg, 1); err != nil {
+			t.Fatalf("recovery: %v", err)
+		}
+		for _, n := range names {
+			if got := readFile(t, filepath.Join(dir, n)); got != "old "+n {
+				t.Errorf("%s = %q", n, got)
+			}
+		}
+		if got := listDir(t, dir); !slices.Equal(got, names) {
+			t.Errorf("dir %v", got)
+		}
+		return injected
+	}
+	for n, more := 1, true; more; n++ {
+		t.Run(fmt.Sprint("rename", n), func(t *testing.T) { more = run(t, n, 0) })
+	}
+	for n, more := 1, true; more; n++ {
+		t.Run(fmt.Sprint("crash", n), func(t *testing.T) { more = run(t, 0, n) })
+	}
+}
+
+// TestPeekCleanup checks that leftovers of a finished update are reported,
+// since they keep a new update from starting.
+func TestPeekCleanup(t *testing.T) {
+	dir := t.TempDir()
+	a := filepath.Join(dir, "a")
+	must(t, os.WriteFile(a+".t", []byte("left"), 0o644))
+	j := JournalFor(a)
+	must(t, j.save(&journalState{Phase: phaseCleanup, Files: []journalFile{{Target: a, Staged: a + ".s", Backup: a + backupSuffix, Trash: a + ".t"}}}))
+	if out, err := j.Peek(); err != nil || out.Status != StatusCleanup {
+		t.Fatalf("peek: %+v %v", out, err)
+	}
+	if out, err := j.Recover(bg); err != nil || out.Status != StatusIdle {
+		t.Fatalf("recover: %+v %v", out, err)
+	}
+	if out, err := j.Peek(); err != nil || out.Status != StatusIdle {
+		t.Fatalf("peek after: %+v %v", out, err)
 	}
 }
