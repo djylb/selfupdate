@@ -3,6 +3,7 @@ package selfupdate
 import (
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -140,7 +141,10 @@ func TestUpdaterRefusals(t *testing.T) {
 				return nil
 			}
 		}, ErrRefused, manifestOf("app", e.release(t, "2.0.0", ""))},
-		"bad current": {func(u *Updater) { u.Current = "" }, ErrInvalidVersion, manifestOf("app", e.release(t, "2.0.0", ""))},
+		"same version":       {func(u *Updater) { u.Current = "2.0.0" }, ErrUpToDate, manifestOf("app", e.release(t, "2.0.0", ""))},
+		"reinstall":          {func(u *Updater) { u.Current = "2.0.0"; u.Reinstall = true }, nil, manifestOf("app", e.release(t, "2.0.0", ""))},
+		"reinstall no older": {func(u *Updater) { u.Reinstall = true }, ErrUpToDate, manifestOf("app", e.release(t, "0.9.0", ""))},
+		"bad current":        {func(u *Updater) { u.Current = "" }, ErrInvalidVersion, manifestOf("app", e.release(t, "2.0.0", ""))},
 	}
 	for name, c := range cases {
 		u := e.publish(t, c.m)
@@ -162,6 +166,51 @@ func TestUpdaterRefusals(t *testing.T) {
 	}
 	if err := u.Apply(t.Context(), nil); !errors.Is(err, ErrNotChecked) {
 		t.Errorf("nil candidate: %v", err)
+	}
+}
+
+func TestUpdaterSameMemberTwiceAndVerify(t *testing.T) {
+	e := newUpdaterEnv(t)
+	u := e.publish(t, manifestOf("app", e.release(t, "2.0.0", "")))
+	other := filepath.Join(t.TempDir(), "app")
+	u.Files = []File{{Member: "app", Target: "app", Mode: 0o755}, {Member: "app", Target: other, Mode: 0o755}}
+	var seen []string
+	u.Verify = func(_ context.Context, c *Candidate, staged []string, artifact io.ReaderAt) error {
+		for _, p := range staged {
+			seen = append(seen, readFile(t, p))
+		}
+		dat := filepath.Join(t.TempDir(), "app.dat")
+		return Extract(t.Context(), artifact, c.Artifact.Size, c.Artifact.Format, []Member{{Name: "app.dat", Path: dat}}, ExtractOptions{})
+	}
+	c, err := u.Check(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	u.DryRun = true
+	if err := u.Install(t.Context(), c); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(seen, []string{"app 2.0.0", "app 2.0.0"}) || readFile(t, e.exe) != "app 1.0.0" {
+		t.Fatalf("dry run: seen %v", seen)
+	}
+	u.DryRun = false
+	refuse := errors.New("does not start")
+	u.Verify = func(context.Context, *Candidate, []string, io.ReaderAt) error { return refuse }
+	if err := u.Install(t.Context(), c); !errors.Is(err, refuse) {
+		t.Fatalf("refused verify: %v", err)
+	}
+	if readFile(t, e.exe) != "app 1.0.0" {
+		t.Fatal("replaced despite failed verify")
+	}
+	if got := listDir(t, filepath.Dir(e.exe)); !slices.Equal(got, []string{"app"}) {
+		t.Errorf("dir %v", got)
+	}
+	u.Verify = nil
+	if err := u.Install(t.Context(), c); err != nil {
+		t.Fatal(err)
+	}
+	if readFile(t, e.exe) != "app 2.0.0" || readFile(t, other) != "app 2.0.0" {
+		t.Fatal("not installed at both targets")
 	}
 }
 

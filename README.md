@@ -181,9 +181,12 @@ if err := u.Apply(ctx, c); err != nil { return err }
 By default `Apply` replaces the executable with the archive member named
 like it (`app`, or `app.exe` on Windows). Set `Files` to install several
 files, or whole directories (`Dir`), from one artifact as one set, such as
-a program and its plugins or web assets. The journal stays next to the
-executable whatever `Files` lists. `DryRun` stops after verification and
-staging. `DownloadDir` keeps partial downloads so they resume. While an
+a program and its plugins or web assets; one member may go to several
+targets. The journal stays next to the executable whatever `Files` lists.
+`Verify` sees the unpacked files before anything is replaced, for example
+to run the new executable once, and can stop the update. `Reinstall`
+accepts the running version again, to repair an installation. `DryRun`
+stops after verification and staging. `DownloadDir` keeps partial downloads so they resume. While an
 update is pending or in progress, or a finished one left files that cannot
 be deleted yet (`Peek` reports `StatusCleanup`), `Apply` fails at once with
 `ErrBusy` instead of downloading again, and checking for the pending version itself gives

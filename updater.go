@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -131,7 +132,8 @@ type Updater struct {
 	Channels []string
 	// Files selects what to install. Empty means one file: the executable,
 	// taken from the archive member named like the executable (with
-	// ".exe" for windows), created with mode 0o755.
+	// ".exe" for windows), created with mode 0o755. Several entries may
+	// install the same member at different targets.
 	Files []File
 	// Extract bounds and observes archive extraction.
 	Extract ExtractOptions
@@ -143,6 +145,20 @@ type Updater struct {
 	// newest one offered. Without it older releases are never installed,
 	// so replaying an old signed manifest cannot roll clients back.
 	AllowDowngrade bool
+	// Reinstall accepts a release equal to Current, to repair an
+	// installation. It never makes an older release acceptable.
+	Reinstall bool
+	// Verify, when set, runs after the artifact was downloaded, verified
+	// and unpacked, and before anything is replaced; an error stops the
+	// update and removes the staged files. staged holds the unpacked file
+	// or directory of each entry of Files, in order (the executable alone
+	// when Files is empty). artifact is the verified artifact, open for
+	// reading other members, for example with [Extract]; its size and
+	// format are those of c.Artifact. Use it to check that a new
+	// executable starts on this system before it replaces the old one. It
+	// also runs with DryRun and runs on the calling goroutine with no lock
+	// held.
+	Verify func(ctx context.Context, c *Candidate, staged []string, artifact io.ReaderAt) error
 	// DryRun makes Apply and Install stop after downloading, verifying and
 	// staging: nothing is replaced and the staged files are removed.
 	DryRun bool
@@ -253,7 +269,7 @@ func (u *Updater) Check(ctx context.Context) (*Candidate, error) {
 	if best != nil {
 		order = bestV.Compare(current)
 	}
-	if best == nil || order == 0 || (order < 0 && !u.AllowDowngrade) {
+	if best == nil || (order == 0 && !u.Reinstall) || (order < 0 && !u.AllowDowngrade) {
 		if missing {
 			return nil, ErrNoArtifact
 		}
@@ -442,14 +458,29 @@ func (u *Updater) install(ctx context.Context, c *Candidate, pending bool) (err 
 		return err
 	}
 	defer func() { err = errors.Join(err, staged.Abort(context.WithoutCancel(ctx))) }()
+	// A member installed at several targets is extracted once and copied.
 	var members []Member
+	first := map[string]string{} // member name -> staged path
+	var copies [][2]string       // from, to
 	for i, p := range staged.Paths() {
-		if fl := files[i]; !fl.Dir {
-			members = append(members, Member{Name: fl.Member, Path: p, Mode: fl.Mode})
+		fl := files[i]
+		if fl.Dir {
+			continue
 		}
+		if from, ok := first[fl.Member]; ok {
+			copies = append(copies, [2]string{from, p})
+			continue
+		}
+		first[fl.Member] = p
+		members = append(members, Member{Name: fl.Member, Path: p, Mode: fl.Mode})
 	}
 	if len(members) > 0 {
 		if err := Extract(ctx, f, a.Size, a.Format, members, u.Extract); err != nil {
+			return err
+		}
+	}
+	for _, c := range copies {
+		if err := copyStaged(c[0], c[1]); err != nil {
 			return err
 		}
 	}
@@ -460,10 +491,30 @@ func (u *Updater) install(ctx context.Context, c *Candidate, pending bool) (err 
 			}
 		}
 	}
+	if u.Verify != nil {
+		if err := u.Verify(ctx, c, staged.Paths(), f); err != nil {
+			return err
+		}
+	}
 	if u.DryRun {
 		return nil
 	}
 	return staged.Replace(ctx, ReplaceOptions{Version: c.Version, Previous: c.Current, Pending: pending})
+}
+
+// copyStaged copies the staged file from to the staging path to, with the
+// same permission bits. Like extraction it never replaces an existing file.
+func copyStaged(from, to string) error {
+	in, err := os.Open(from)
+	if err != nil {
+		return err
+	}
+	defer closeQuietly(in)
+	fi, err := in.Stat()
+	if err != nil {
+		return err
+	}
+	return writeLimited(to, fi.Mode().Perm(), in, fi.Size())
 }
 
 // downloadKey names the download file after the content, so a resumed
