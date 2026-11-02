@@ -8,7 +8,7 @@
 //	selfupdate artifact -name app -os linux -arch amd64 [-format tar.gz] [-url URL] [-member app]
 //	        [-into manifest.json -version 1.5.0 [-channel beta] [-notes text]] dist/app_linux_amd64.tar.gz
 //	selfupdate sign -key release.key [-expires 720h] [-in manifest.json] [-out manifest.signed.json]
-//	selfupdate verify -pub ed25519:... [-in manifest.signed.json] [-dist dir] [-fetch]
+//	selfupdate verify -pub ed25519:... [-in manifest.signed.json] [-dist dir] [-fetch] [-out manifest.json]
 //	selfupdate sign-file -key release.key [-out file.sig] file
 //	selfupdate verify-file -pub ed25519:... -sig file.sig file
 //
@@ -22,7 +22,8 @@
 // verify checks the size and digests of every artifact: relative URLs
 // against the files below the -dist directory, absolute http and https
 // URLs by downloading them with -fetch. An artifact neither flag covers
-// is an error, so a pass covers the whole manifest. Every output file is
+// is an error, so a pass covers the whole manifest. verify -out writes the
+// verified manifest to a file that sign accepts, to renew it. Every output file is
 // replaced atomically.
 package main
 
@@ -317,6 +318,7 @@ func verify(args []string, stdin io.Reader, stdout io.Writer) error {
 	in := flags.String("in", "-", "signed manifest")
 	dist := flags.String("dist", "", "directory to check the artifacts with relative URLs against")
 	fetch := flags.Bool("fetch", false, "download and check the artifacts with absolute http(s) URLs")
+	out := flags.String("out", "", "file to write the verified manifest to, ready to sign again; default standard output")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -339,6 +341,13 @@ func verify(args []string, stdin io.Reader, stdout io.Writer) error {
 	}
 	if _, err := fmt.Fprintf(stdout, "signed by: %s\n", strings.Join(opened.KeyIDs, ", ")); err != nil {
 		return err
+	}
+	if *out != "" {
+		b, err := json.MarshalIndent(opened.Manifest, "", "  ")
+		if err != nil {
+			return err
+		}
+		return writeAtomic(*out, append(b, '\n'), 0o644)
 	}
 	enc := json.NewEncoder(stdout)
 	enc.SetIndent("", "  ")

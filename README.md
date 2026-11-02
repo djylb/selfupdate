@@ -115,7 +115,7 @@ JSON form of `Manifest`, read as strictly as clients read it:
 
 `sign` sets the publication time to now and the expiry to now plus
 `-expires`; re-sign before the manifest expires, even without a new release
-(the output of `verify` can be signed again). To rotate keys, release a
+(`verify -out manifest.json` writes the verified manifest, ready to be signed again). To rotate keys, release a
 version trusting both keys, sign with both for a while, then sign with the
 new key only. `SignManifest` does the same from Go; `sign-file` and
 `verify-file` handle detached signatures.

@@ -61,6 +61,14 @@ func TestSignAndVerify(t *testing.T) {
 	if !strings.Contains(out.String(), `"version": "1.0.0"`) {
 		t.Errorf("verify output %s", out.String())
 	}
+	// The verified manifest can be signed again to renew it.
+	renew := filepath.Join(dir, "renew.json")
+	if err := run([]string{"verify", "-pub", pub, "-in", signed, "-out", renew}, nil, &out); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"sign", "-key", keyFile, "-in", renew, "-out", signed}, nil, &out); err != nil {
+		t.Fatalf("sign the verified manifest: %v", err)
+	}
 	if err := os.WriteFile(bin, []byte("BINARY"), 0o755); err != nil {
 		t.Fatal(err)
 	}
