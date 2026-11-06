@@ -71,15 +71,34 @@ func (s Status) String() string {
 type Outcome struct {
 	// Version is the version that was installed by the update, as passed
 	// in [ReplaceOptions]. After a rollback it names the version that
-	// failed; see [Updater.Skip].
+	// failed; see [Updater.RecordOutcome].
 	Version string
 	// Previous is the version that was replaced.
 	Previous string
+	// Digest identifies the installed artifact, as passed in
+	// [ReplaceOptions].
+	Digest string
 	// Boots counts the starts of a pending update so far.
 	Boots int
 	// Status says what happened.
 	Status Status
+	// Cause says why an update was rolled back.
+	Cause RollbackCause
 }
+
+// RollbackCause says why [StatusRolledBack] happened.
+type RollbackCause int
+
+const (
+	// RollbackNone means no rollback happened.
+	RollbackNone RollbackCause = iota
+	// RollbackUnconfirmed means a new version used up its starts without
+	// [Journal.Commit]: its health check failed or it did not get that far.
+	RollbackUnconfirmed
+	// RollbackInterrupted means the swap itself was cut short, as by a power
+	// failure, which says nothing about the new version.
+	RollbackInterrupted
+)
 
 // Replacement pairs a staged file or directory with the one it replaces.
 type Replacement struct {
@@ -94,8 +113,8 @@ type Replacement struct {
 
 // ReplaceOptions controls how a replacement is recorded.
 type ReplaceOptions struct {
-	// Version and Previous are recorded for [Outcome].
-	Version, Previous string
+	// Version, Previous and Digest are recorded for [Outcome].
+	Version, Previous, Digest string
 	// Pending keeps the backups and leaves the update awaiting
 	// [Journal.Commit]; otherwise the replacement is final at once.
 	Pending bool
@@ -169,6 +188,8 @@ type journalState struct {
 	Phase    string        `json:"phase"`
 	Version  string        `json:"version,omitempty"`
 	Previous string        `json:"previous,omitempty"`
+	Digest   string        `json:"digest,omitempty"`
+	Cause    RollbackCause `json:"cause,omitempty"`
 	Files    []journalFile `json:"files"`
 	Boots    int           `json:"boots"`
 }
@@ -422,8 +443,8 @@ func (j Journal) Stage(ctx context.Context, targets ...string) (*Staged, error) 
 			}
 			files = append(files, f)
 		}
-		// Stage locks are taken, and swept, only under the journal lock,
-		// so with no staging recorded nobody alive holds it.
+		// Stage locks are taken and swept under the journal lock, or held by
+		// a running action for its whole run; held means somebody is at work.
 		sl, err := tryLockFile(j.stageLock())
 		if errors.Is(err, errLocked) {
 			return ErrBusy
@@ -641,7 +662,7 @@ func (j Journal) apply(st *journalState, opts ReplaceOptions) error {
 			return fmt.Errorf("selfupdate: stale backup: %w", err)
 		}
 	}
-	st.Phase, st.Version, st.Previous = phaseApplying, opts.Version, opts.Previous
+	st.Phase, st.Version, st.Previous, st.Digest = phaseApplying, opts.Version, opts.Previous, opts.Digest
 	if err := j.save(st); err != nil {
 		return err
 	}
@@ -780,7 +801,7 @@ func (j Journal) Peek() (Outcome, error) {
 	if err != nil || !ok {
 		return Outcome{Status: StatusIdle}, err
 	}
-	out := Outcome{Version: st.Version, Previous: st.Previous, Boots: st.Boots}
+	out := Outcome{Version: st.Version, Previous: st.Previous, Digest: st.Digest, Boots: st.Boots}
 	switch st.Phase {
 	case phaseCleanup:
 		return Outcome{Status: StatusCleanup}, nil
@@ -833,7 +854,7 @@ func (j Journal) recover(ctx context.Context, maxBoots int) (Outcome, error) {
 		if err != nil || !ok {
 			return err
 		}
-		out = Outcome{Version: st.Version, Previous: st.Previous, Boots: st.Boots}
+		out = Outcome{Version: st.Version, Previous: st.Previous, Digest: st.Digest, Boots: st.Boots}
 		switch st.Phase {
 		case phaseCleanup:
 			out = Outcome{}
@@ -859,14 +880,20 @@ func (j Journal) recover(ctx context.Context, maxBoots int) (Outcome, error) {
 				out.Boots, out.Status = st.Boots, StatusPending
 				return j.save(&st)
 			}
-		case phaseApplying, phaseRestoring:
+			st.Cause = RollbackUnconfirmed
+		case phaseApplying:
+			st.Cause = RollbackInterrupted
+		case phaseRestoring:
+			if st.Cause == RollbackNone {
+				st.Cause = RollbackInterrupted
+			}
 		default:
 			return fmt.Errorf("%w: %s: unknown phase %q", ErrCorruptJournal, j.Path, st.Phase)
 		}
 		if err := j.restore(&st); err != nil {
 			return err
 		}
-		out.Status = StatusRolledBack
+		out.Status, out.Cause = StatusRolledBack, st.Cause
 		return nil
 	})
 	if err != nil {

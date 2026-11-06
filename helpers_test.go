@@ -105,9 +105,12 @@ func artifactFor(name, url string, format Format, data []byte) Artifact {
 
 func manifestOf(product string, releases ...Release) *Manifest {
 	return &Manifest{
+		Format:    ManifestFormat,
+		Serial:    1,
 		Product:   product,
 		Published: testNow.Add(-time.Hour),
 		Expires:   testNow.Add(24 * time.Hour),
+		Baseline:  []Rule{},
 		Releases:  releases,
 	}
 }

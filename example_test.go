@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"slices"
 	"time"
 
 	"github.com/djylb/selfupdate"
@@ -14,13 +13,6 @@ import (
 
 // The release key's public half, compiled into the program.
 const releaseKey = "ed25519:11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo="
-
-// Settings the program keeps between runs, such as in its configuration
-// directory.
-var (
-	minPublished time.Time
-	rolledBack   []string
-)
 
 // Example shows the life cycle of a program that updates itself.
 func Example() {
@@ -34,6 +26,16 @@ func Example() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	pub, err := selfupdate.ParsePublicKey(releaseKey)
+	if err != nil {
+		log.Fatal(err)
+	}
+	u := &selfupdate.Updater{
+		Sources: []selfupdate.Source{&selfupdate.HTTPSource{URL: "https://updates.example.com/app/manifest.json"}},
+		Trust:   selfupdate.Trust{Keys: []selfupdate.TrustedKey{{Public: pub}}},
+		Product: "app",
+		Current: "1.4.2",
+	}
 	switch out.Status {
 	case selfupdate.StatusPending:
 		// Running the new version for the first time: check health, then
@@ -42,40 +44,28 @@ func Example() {
 			log.Print(err)
 		}
 	case selfupdate.StatusRolledBack:
-		// The old files are back: never offer this version again, and
-		// run the old code.
-		rolledBack = append(rolledBack, out.Version)
+		// The old files are back: remember the failure, so the next checks
+		// wait before trying again, and run the old code.
+		if err := u.RecordOutcome(ctx, out); err != nil {
+			log.Print(err)
+		}
 		restart()
 	case selfupdate.StatusIdle, selfupdate.StatusInProgress, selfupdate.StatusCleanup:
 	}
 
-	pub, err := selfupdate.ParsePublicKey(releaseKey)
-	if err != nil {
-		log.Fatal(err)
-	}
-	u := &selfupdate.Updater{
-		Source:       &selfupdate.HTTPSource{URL: "https://updates.example.com/app/manifest.json"},
-		Trust:        selfupdate.Trust{Keys: []selfupdate.TrustedKey{{Public: pub}}},
-		Product:      "app",
-		Current:      "1.4.2",
-		MinPublished: minPublished,
-		OnManifest: func(_ context.Context, o *selfupdate.Opened) error {
-			minPublished = o.Manifest.Published // persist it
-			return nil
-		},
-		Skip: func(v string) bool { return slices.Contains(rolledBack, v) },
-	}
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
-	c, err := u.Update(ctx)
+	plan, err := u.Update(ctx)
 	cancel()
 	switch {
-	case errors.Is(err, selfupdate.ErrUpToDate), errors.Is(err, selfupdate.ErrPendingRestart):
+	case errors.Is(err, selfupdate.ErrPendingRestart):
 		return
 	case err != nil:
 		log.Print(err)
 		return
+	case plan.Candidate == nil:
+		return // up to date or held back: plan.Route says why
 	}
-	log.Printf("installed %s, restarting", c.Version)
+	log.Printf("installed %s, restarting", plan.Candidate.Version)
 	restart()
 }
 
@@ -96,6 +86,9 @@ func ExampleSignManifest() {
 	binary := []byte("the linux/amd64 build")
 	d := selfupdate.DigestsOf(binary)
 	m := &selfupdate.Manifest{
+		Format:    selfupdate.ManifestFormat,
+		Serial:    1,
+		Baseline:  []selfupdate.Rule{},
 		Product:   "app",
 		Published: time.Now(),
 		Expires:   time.Now().Add(30 * 24 * time.Hour),
@@ -126,7 +119,7 @@ func ExampleUpdater_Install() {
 	pub, _ := selfupdate.ParsePublicKey(releaseKey)
 	const db = "/var/lib/app/rules.db"
 	u := &selfupdate.Updater{
-		Source:  &selfupdate.DirSource{Dir: "/media/usb/rules"},
+		Sources: []selfupdate.Source{&selfupdate.DirSource{Dir: "/media/usb/rules"}},
 		Trust:   selfupdate.Trust{Keys: []selfupdate.TrustedKey{{Public: pub}}},
 		Product: "rules",
 		Current: "2026.10.1",
@@ -138,11 +131,11 @@ func ExampleUpdater_Install() {
 		log.Print(err)
 		return
 	}
-	c, err := u.Check(ctx)
-	if err != nil {
+	plan, err := u.Check(ctx)
+	if err != nil || plan.Candidate == nil {
 		return
 	}
-	if err := u.Install(ctx, c); err != nil {
+	if err := u.Install(ctx, plan.Candidate); err != nil {
 		log.Print(err)
 	}
 }

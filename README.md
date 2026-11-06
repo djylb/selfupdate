@@ -23,8 +23,11 @@ go get github.com/djylb/selfupdate
   signatures over a single file are available too (`SignArtifact`,
   `VerifyArtifact`).
 - **Versions.** Semantic versions with full pre-release ordering
-  (`ParseVersion`, `CompareVersions`). Pre-releases and extra channels are
-  opt-in; `Skip` hides releases, such as one that was rolled back.
+  (`ParseVersion`, `CompareVersions`) and version sets (`ParseVersionSet`).
+- **Upgrade paths.** Rules in the manifest say which versions can go where:
+  stepping stones, manual-only boundaries, retractions, no-way-back lines,
+  rollouts, channels, conditions on facts such as peer versions. `Resolve` is
+  a pure function that finds the route. See [Upgrade paths](#upgrade-paths).
 - **Downloads.** `Download` bounds the size, resumes interrupted downloads,
   hashes as it streams (only the digests the artifact lists, SHA-256 and
   SHA-512 supported), reports progress and returns the verified file open,
@@ -47,7 +50,8 @@ go get github.com/djylb/selfupdate
 - **Restart.** `Relaunch` re-executes the program in place on Unix and
   starts a successor on Windows.
 - **Policy.** `OnManifest` sees every verified manifest and `Authorize`
-  every candidate (version, channel, signers, artifact); either can refuse.
+  every candidate (version, channels, signers, artifact); either can refuse.
+  `LocalRules` add the program's own gates.
 
 ## Threat model
 
@@ -59,15 +63,15 @@ caches may serve anything. The signing key is the only root of trust.
 | Modified or substituted artifact | The signed manifest pins the exact size and digest of every artifact; content is checked before it is unpacked, and unpacked from the same open file. |
 | Forged manifest | Ed25519 signature over the exact payload bytes, with a context prefix; unsigned manifests are rejected unless `Trust.InsecureSkipSignature` is set. |
 | Hash and package from the same place | Digests come only from the signed manifest, never from a file next to the artifact. |
-| Rollback to an old, vulnerable release | Releases older than the running one are refused unless `AllowDowngrade` is set. |
-| Replay of an old signed manifest (freeze) | Every manifest must carry a publication time and an expiry; expired manifests are rejected. `MinPublished` rejects manifests older than one already seen. |
-| Ambiguous signed JSON | The payload is decoded strictly: unknown fields, duplicate keys and trailing data are rejected, and so are releases listed twice or artifacts that match the same platform, so every reader sees the same content. |
+| Rollback to an old, vulnerable release | Going back needs a grant the client gives (`downgrade:any`, or `downgrade:offered` for one the manifest offers); `Update` never does it by itself. |
+| Replay of an old signed manifest (freeze) | Every manifest has an expiry and a serial that only grows; the `State` keeps the highest seen, `MinSerial` covers a lost state. |
+| Ambiguous signed JSON | Duplicate keys, trailing data, repeated versions and repeated rule ids are rejected. Unknown fields are ignored by clients and refused by publishers, so a misspelt field is caught before signing. |
 | Manifest of one product applied to another | The manifest names its product and the client checks it. |
 | Compromised or retired key | Keys are listed explicitly; remove one or let its `NotAfter` pass. `Threshold` can demand several signers. |
 | Archive path traversal ("zip slip"), links | `Extract` takes output paths from the caller only; `ExtractDir` and `DirSource` check every name with `filepath.Localize` and refuse links and devices. |
 | Decompression bombs | Per-file, total and entry-count limits. |
-| Remote party forcing an update | `Authorize` hook, channel and pre-release opt-in. |
-| Broken release | Pending state, health-checked commit, automatic rollback, `Skip` for releases that were rolled back. |
+| Remote party forcing an update | `Authorize` hook, channels, rules that need grants. |
+| Broken release | Pending state, health-checked commit, automatic rollback, and a growing wait before that edge is tried again (`RecordOutcome`). |
 | Crash or power loss mid-update | Journal written atomically before any rename, directories synced; the next start finishes or undoes it. |
 | Concurrent updaters | Operating system locks per journal and per shared download; concurrent journal operations wait their turn, a second update gets `ErrBusy`. |
 
@@ -89,6 +93,7 @@ add each artifact to the manifest and sign it:
 ```
 selfupdate artifact -name app -os linux -arch amd64 -member app \
     -into manifest.json -version 1.5.0 dist/app_1.5.0_linux_amd64.tar.gz
+selfupdate lint -in manifest.json -previous last.json
 selfupdate sign -key release.key -expires 720h -in manifest.json -out dist/manifest.json
 selfupdate verify -pub ed25519:... -in dist/manifest.json -dist dist
 ```
@@ -101,24 +106,139 @@ its file below `dir`; artifacts with absolute `http`/`https` URLs are
 downloaded and checked the same way with `-fetch`. An artifact the given
 flags do not cover makes `verify` fail and lists it, so a pass means every
 artifact was checked. `manifest.json` is the
-JSON form of `Manifest`, read as strictly as clients read it:
+JSON form of `Manifest`, and `sign` refuses unknown fields and lint errors:
 
 ```jsonc
 {
+  "format": 1,
   "product": "app",
+  "baseline": [],
   "releases": [
     {"version": "1.5.0", "artifacts": [ /* added by "selfupdate artifact" */ ]},
-    {"version": "1.6.0-rc.1", "channel": "beta", "artifacts": [ ]}
+    {"version": "1.6.0-rc.1", "channels": ["beta"], "artifacts": [ ]}
   ]
 }
 ```
 
-`sign` sets the publication time to now and the expiry to now plus
-`-expires`; re-sign before the manifest expires, even without a new release
+`sign` sets the publication time to now, the expiry to now plus `-expires` and
+the serial to one above its input; re-sign before the manifest expires, even
+without a new release
 (`verify -out manifest.json` writes the verified manifest, ready to be signed again). To rotate keys, release a
 version trusting both keys, sign with both for a while, then sign with the
-new key only. `SignManifest` does the same from Go; `sign-file` and
-`verify-file` handle detached signatures.
+new key only. `SignManifest` signs from Go without the checks of `lint`, so run `Manifest.Lint` first; `sign-file` and
+`verify-file` handle detached signatures. Keep one manifest for the product at
+a fixed address, listing every maintenance line, and do not put a pre-release
+outside a channel: everyone would see it. Serials never go down, so to go back
+to an older manifest run `selfupdate revert -from old.json -in manifest.json`
+and sign the result.
+
+## Upgrade paths
+
+Versions form an implicit graph: every forward edge is open, every other edge
+closed, and rules change that. A rule has a `from` and `to` version set,
+conditions, and one of three effects:
+
+| Effect | Meaning |
+| --- | --- |
+| `block` | The edge is closed unless the caller holds a grant from `unlock`. With no `unlock` nothing lifts it. |
+| `allow` | Cancels `baseline` gates on the edge and offers a downgrade. It never cancels a block in `rules`. |
+| `notice` | Information only; it never affects routing. |
+
+`baseline` is mandatory and states the default gates, so a forgotten rule fails
+safe. `rules` holds the exceptions; their order has no meaning.
+
+```jsonc
+{
+  "baseline": [
+    {"id": "major", "effect": "block", "unlock": ["accept:major"], "url": "https://example.com/major",
+     "when": [{"fact": "edge.crosses", "in": ["major"]}]}
+  ],
+  "rules": [
+    // A stepping stone: first go to 1.9.4.
+    {"id": "stone", "effect": "block", "from": "<1.9.4", "to": ">=1.10.0-0", "url": "https://example.com/1.9"},
+    // No way back past a migration.
+    {"id": "no-back", "effect": "block", "from": ">=2.0.0-0", "to": "<2.0.0-0"},
+    // A retracted release, and a hint for those who have it.
+    {"id": "bad", "effect": "block", "to": "=1.5.2", "unlock": ["force"]},
+    {"id": "bad-note", "effect": "notice", "class": "retracted", "from": "=1.5.2"}
+  ]
+}
+```
+
+Boundaries use `-0`, the lowest pre-release of a version: `<2.0.0` still holds
+`2.0.0-rc.1`. `lint` reports boundaries that miss a listed pre-release.
+
+**Grants** are open strings the program gives per run: nothing for a background
+check, `user` and `rollout` when somebody asks for an update, more for a force
+option. `force`, `rollout`, `reinstall`, `downgrade:any`, `downgrade:offered`,
+`retry-failed` and `channel:<name>` mean something to the package; rules may name
+anything else, such as `accept:<rule-id>`. `Route.Offers` says what a grant
+would open, for a dialog.
+
+**Facts** feed conditions. `os`, `arch`, `name`, `to.label` and `edge.crosses`
+are built in; others are declared in `facts`, passed in `Updater.Facts`, and
+every condition on them says what a missing value means. Only facts declared
+`stable` count on later edges of a route.
+
+**The route.** `Route.Next` is the step to take. Later steps cannot be judged for
+certain, since what a future version will know is not known yet, so `Goal` is
+the highest version reachable for certain and `Horizon` the highest reachable if
+everything uncertain opens up. Routing is optimistic: it heads for `Horizon`,
+preferring certain ways when several reach as high. A real fork can still
+pick the higher way and stop in front of a gate that never opens, below what the
+certain way would have reached; compare `Goal` with `Horizon`, or close the fork
+with a rule.
+
+**Capabilities** keep old clients safe from new things. Each layer has
+`requires`: the manifest (unusable as a whole), a release (does not exist for
+that source), an artifact (the next one is taken) and a rule (`if_unknown` decides).
+A format, digest or action of an artifact counts as `format:<x>`, `digest:<x>`,
+`action:<kind>`. A release's `provides` is its complete set, exported from the
+build (`LibraryCapabilities` plus its own), which lets a route use a version as
+a bridge to one the running version cannot install. Clients ignore unknown
+fields, and damage stays in its entry.
+
+**When a new version refuses.** Only the new version knows what it can take over
+from. Compile the bound in and check it in `Verify`, by running the staged
+program, and on the first start:
+
+```go
+var minUpgradeFrom = selfupdate.MustVersionSet(">=1.9.4")
+err := selfupdate.CheckUpgradeFrom(from, minUpgradeFrom)
+```
+
+A refusal (`ErrUpgradeFromRejected`, or `RejectUpgrade` on a first start) is
+remembered for that source and artifact and does not expire; `Update` goes on
+with the next way at once.
+
+| Failure | Remembered | Wait |
+| --- | --- | --- |
+| New version refused the source | Yes | None: taken out until the artifact changes |
+| Rolled back, unconfirmed (`RecordOutcome`), or undone by `Journal.Rollback` (noticed by the next `Check`) | Yes | 1 hour, times 4 per repeat, at most 7 days (`FailureBackoff`) |
+| Handoff not confirmed in time | Yes | The same |
+| Rollback of an interrupted swap, reported to `RecordOutcome` | No | |
+| Download, permissions, other `Verify` or action errors | No | |
+
+The grant `retry-failed` lifts the first three. A new artifact digest voids
+the record. A new version must not write destructively while pending, since it
+may still be rolled back; after `Commit` there is no automatic way back.
+
+**Other ways to install.** `Updater.FilesFor` picks the files per candidate, from
+its attrs, with paths that stay in compiled code. `Updater.Actions` runs code of
+the program for artifacts with an `action`; it may return `ActionHandedOff` when
+an installer takes over, which holds further updates until `ConfirmHandoff` or
+`HandoffTimeout`. The handoff is recorded before the action starts and cleared
+when it returns an error or `ActionDone`, so an installer that ends the program
+is not started twice. After `ActionDone` the update counts as awaiting a restart
+(`ErrPendingRestart`) until the new version runs; if the old version still runs
+after `HandoffTimeout`, it counts as a failure. While a handoff or a finished
+action is open, no swap starts either (`ErrBusy`). One action runs at a time per
+journal, under a file lock; it must not apply another candidate. There is no journal behind an action:
+atomicity and rollback are up to it.
+
+**State.** `Updater.State` keeps the serial, a rollout identifier that is never
+reported, and the failure records, by default in a file next to the journal. It
+holds no rules, so a new manifest always corrects a bad one.
 
 ## Using it
 
@@ -137,8 +257,9 @@ case selfupdate.StatusPending:
 		err = j.Commit(ctx)
 	}
 case selfupdate.StatusRolledBack:
-	// The previous files are back: remember out.Version to skip it, and
-	// run the old code.
+	// The previous files are back: remember the failure and run the old
+	// code.
+	_ = u.RecordOutcome(ctx, out)
 	return selfupdate.Relaunch("", nil)
 }
 ```
@@ -156,26 +277,25 @@ Check for and apply updates:
 
 ```go
 u := &selfupdate.Updater{
-	Source:  &selfupdate.HTTPSource{URL: "https://updates.example.com/app/manifest.json"},
+	Sources: []selfupdate.Source{
+		&selfupdate.HTTPSource{URL: "https://updates.example.com/app/manifest.json"},
+		&selfupdate.HTTPSource{URL: "https://mirror.example.com/app/manifest.json"},
+	},
 	Trust:   selfupdate.Trust{Keys: []selfupdate.TrustedKey{{Public: releaseKey}}},
 	Product: "app",
 	Current: version,
-	MinPublished: settings.MinPublished,
-	OnManifest: func(_ context.Context, o *selfupdate.Opened) error {
-		settings.MinPublished = o.Manifest.Published // persist it
-		return nil
-	},
-	Skip: func(v string) bool { return slices.Contains(settings.RolledBack, v) },
 }
-c, err := u.Check(ctx)          // or u.Update(ctx) to check and apply
+plan, err := u.Check(ctx)       // or u.Update(ctx) to check and apply
 switch {
-case errors.Is(err, selfupdate.ErrUpToDate), errors.Is(err, selfupdate.ErrPendingRestart):
+case errors.Is(err, selfupdate.ErrPendingRestart):
 	return nil
 case err != nil:
-	return err // ErrNoArtifact: no build for this name and platform
+	return err
+case plan.Candidate == nil:
+	return nil // up to date or held back: plan.Route says which, and why
 }
-if err := u.Apply(ctx, c); err != nil { return err }
-// restart into c.Version
+if err := u.Apply(ctx, plan.Candidate); err != nil { return err }
+// restart into plan.Candidate.Version
 ```
 
 By default `Apply` replaces the executable with the archive member named
@@ -184,7 +304,7 @@ files, or whole directories (`Dir`), from one artifact as one set, such as
 a program and its plugins or web assets; one member may go to several
 targets. The journal stays next to the executable whatever `Files` lists.
 `Verify` sees the unpacked files before anything is replaced, for example
-to run the new executable once, and can stop the update. `Reinstall`
+to run the new executable once, and can stop the update. The grant `reinstall`
 accepts the running version again, to repair an installation. `DryRun`
 stops after verification and staging. `DownloadDir` keeps partial downloads so they resume. While an
 update is pending or in progress, or a finished one left files that cannot

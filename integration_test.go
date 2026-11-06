@@ -104,18 +104,21 @@ func helperRun(args []string) error {
 			return err
 		}
 		u := &Updater{
-			Source:  &HTTPSource{URL: args[1]},
+			Sources: []Source{&HTTPSource{URL: args[1]}},
 			Trust:   Trust{Keys: []TrustedKey{{Public: pub}}},
 			Product: "helper",
 			Current: version,
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 		defer cancel()
-		c, err := u.Update(ctx)
+		plan, err := u.Update(ctx)
 		if err != nil {
 			return err
 		}
-		report += " applied " + c.Version
+		if plan.Candidate == nil {
+			return errors.New("nothing to apply")
+		}
+		report += " applied " + plan.Candidate.Version
 		if args[0] == "update-relaunch" {
 			return Relaunch(exe, []string{os.Args[0], "report", args[3]})
 		}
@@ -156,6 +159,7 @@ func TestSelfReplaceIntegration(t *testing.T) {
 	}
 	srv := newFileServer(t)
 	key := newTestKey(t)
+	var serial uint64
 	publish := func(version string, format Format) {
 		data := build(version)
 		if format == FormatTarGzip {
@@ -165,7 +169,8 @@ func TestSelfReplaceIntegration(t *testing.T) {
 		srv.put(file, data)
 		a := artifactFor("helper", file, format, data)
 		a.OS, a.Arch = runtime.GOOS, runtime.GOARCH
-		m := &Manifest{Product: "helper", Published: time.Now(), Expires: time.Now().Add(time.Hour),
+		serial++
+		m := &Manifest{Format: ManifestFormat, Serial: serial, Baseline: []Rule{}, Product: "helper", Published: time.Now(), Expires: time.Now().Add(time.Hour),
 			Releases: []Release{{Version: version, Artifacts: []Artifact{a}}}}
 		srv.put("manifest.json", mustSign(t, m, key))
 	}
@@ -191,7 +196,10 @@ func TestSelfReplaceIntegration(t *testing.T) {
 			t.Fatalf("%v: got %q, want %q", args, got, want)
 		}
 	}
-	files := func() []string { return listDir(t, dir) }
+	// The state stays next to the journal for good; only the swap is cleaned up.
+	files := func() []string {
+		return slices.DeleteFunc(listDir(t, dir), func(n string) bool { return strings.HasSuffix(n, "-state.json") })
+	}
 
 	// 1.0.0 replaces itself, while running, with 2.0.0 from a tar.gz.
 	publish("2.0.0", FormatTarGzip)
@@ -206,7 +214,7 @@ func TestSelfReplaceIntegration(t *testing.T) {
 	publish("1.5.0", FormatRaw)
 	older := exec.Command(app, "update", manifestURL, pub)
 	older.Env = append(os.Environ(), helperEnv+"=1")
-	if out, err := older.CombinedOutput(); err == nil || !strings.Contains(string(out), ErrUpToDate.Error()) {
+	if out, err := older.CombinedOutput(); err == nil || !strings.Contains(string(out), "nothing to apply") {
 		t.Fatalf("older release: %v %s", err, out)
 	}
 	// 3.0.0 (a raw binary) never confirms: its second start rolls back.

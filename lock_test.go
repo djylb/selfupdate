@@ -264,19 +264,19 @@ func TestReplaceDirectory(t *testing.T) {
 	dir := t.TempDir()
 	web := filepath.Join(dir, "web")
 	must(t, os.MkdirAll(filepath.Join(web, "old"), 0o755))
-	must(t, os.WriteFile(filepath.Join(web, "old", "index.html"), []byte("v1"), 0o644))
+	must(t, os.WriteFile(filepath.Join(web, "old", "index.html"), []byte("old"), 0o644))
 	j := JournalFor(filepath.Join(dir, "app"))
 	s, err := j.Stage(bg, web)
 	must(t, err)
-	data := tarGz(t, true, tarEntry{name: "site/index.html", body: "v2"}, tarEntry{name: "site/css/a.css", body: "c"})
+	data := tarGz(t, true, tarEntry{name: "site/index.html", body: "new"}, tarEntry{name: "site/css/a.css", body: "c"})
 	src := writeTemp(t, t.TempDir(), "site.tar.gz", data)
 	must(t, extractDirAt(src, FormatTarGzip, "site", s.Paths()[0], ExtractOptions{}))
 	must(t, s.Replace(bg, ReplaceOptions{Pending: true}))
-	if readFile(t, filepath.Join(web, "index.html")) != "v2" || readFile(t, filepath.Join(web, "css", "a.css")) != "c" {
+	if readFile(t, filepath.Join(web, "index.html")) != "new" || readFile(t, filepath.Join(web, "css", "a.css")) != "c" {
 		t.Fatal("tree not swapped")
 	}
 	must(t, j.Rollback(bg))
-	if readFile(t, filepath.Join(web, "old", "index.html")) != "v1" {
+	if readFile(t, filepath.Join(web, "old", "index.html")) != "old" {
 		t.Fatal("tree not restored")
 	}
 	if got := listDir(t, dir); !slices.Equal(got, []string{"web"}) {

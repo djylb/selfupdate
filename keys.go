@@ -18,8 +18,8 @@ import (
 // Domain separation prefixes: a signature over a manifest can never be
 // presented as a signature over an artifact digest, or the other way round.
 const (
-	manifestContext = "selfupdate manifest v1\n"
-	artifactContext = "selfupdate artifact v1\n"
+	manifestContext = "selfupdate manifest\n"
+	artifactContext = "selfupdate artifact\n"
 )
 
 // Errors returned by signature verification.
@@ -66,6 +66,10 @@ type Trust struct {
 	// still checked. Never set it for updates fetched over a network you
 	// do not control.
 	InsecureSkipSignature bool
+	// InsecureAcceptExpired accepts expired manifests, as a machine that is
+	// offline for long or has no clock may need. Expiry is what limits
+	// replays of old manifests.
+	InsecureAcceptExpired bool
 }
 
 // KeyID returns the identifier of pub: the hex encoding of the first eight

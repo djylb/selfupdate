@@ -13,9 +13,10 @@ import (
 )
 
 type updaterEnv struct {
-	fs  *fileServer
-	key testKey
-	exe string
+	fs     *fileServer
+	key    testKey
+	exe    string
+	serial uint64
 }
 
 func newUpdaterEnv(t *testing.T) *updaterEnv {
@@ -31,9 +32,12 @@ func newUpdaterEnv(t *testing.T) *updaterEnv {
 // env key, and returns an Updater for them.
 func (e *updaterEnv) publish(t *testing.T, m *Manifest) *Updater {
 	t.Helper()
+	e.serial++
+	m.Serial = e.serial
 	url := e.fs.put("manifest.json", mustSign(t, m, e.key))
 	return &Updater{
-		Source:     &HTTPSource{URL: url},
+		Sources:    []Source{&HTTPSource{URL: url}},
+		State:      FileState(filepath.Join(t.TempDir(), "state.json")),
 		Trust:      e.key.trust(),
 		Now:        func() time.Time { return testNow },
 		Product:    "app",
@@ -51,7 +55,11 @@ func (e *updaterEnv) release(t *testing.T, version, channel string) Release {
 	e.fs.put(name, data)
 	a := artifactFor("app", name, FormatTarGzip, data)
 	a.OS, a.Arch = "linux", "amd64"
-	return Release{Version: version, Channel: channel, Artifacts: []Artifact{a}}
+	r := Release{Version: version, Artifacts: []Artifact{a}}
+	if channel != "" {
+		r.Channels = []string{channel}
+	}
+	return r
 }
 
 func TestUpdaterApplyCommit(t *testing.T) {
@@ -59,10 +67,11 @@ func TestUpdaterApplyCommit(t *testing.T) {
 	u := e.publish(t, manifestOf("app", e.release(t, "1.1.0", ""), e.release(t, "1.0.5", "")))
 	var progressed bool
 	u.Progress = func(int64, int64) { progressed = true }
-	c, err := u.Update(t.Context())
+	plan, err := u.Update(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
+	c := plan.Candidate
 	if c.Version != "1.1.0" || c.Downgrade || !slices.Equal(c.KeyIDs, []string{KeyID(e.key.pub)}) || !progressed {
 		t.Fatalf("candidate %+v", c)
 	}
@@ -83,8 +92,8 @@ func TestUpdaterApplyCommit(t *testing.T) {
 		t.Errorf("dir %v", got)
 	}
 	u.Current = "1.1.0"
-	if _, err := u.Check(t.Context()); !errors.Is(err, ErrUpToDate) {
-		t.Errorf("same version: %v", err)
+	if p, err := u.Check(t.Context()); err != nil || p.Candidate != nil || p.Route.Status != RouteCurrent {
+		t.Errorf("same version: %+v %v", p, err)
 	}
 }
 
@@ -95,10 +104,7 @@ func TestUpdaterSiblingFilesAndInstall(t *testing.T) {
 	if _, err := u.Check(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	c, err := u.Check(t.Context())
-	if err != nil {
-		t.Fatal(err)
-	}
+	c := check(t, u)
 	if err := u.Install(t.Context(), c); err != nil {
 		t.Fatal(err)
 	}
@@ -111,28 +117,41 @@ func TestUpdaterSiblingFilesAndInstall(t *testing.T) {
 	}
 }
 
+// check returns the candidate of a check that must offer one.
+func check(t *testing.T, u *Updater) *Candidate {
+	t.Helper()
+	plan, err := u.Check(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Candidate == nil {
+		t.Fatalf("no candidate: %+v", plan.Route)
+	}
+	return plan.Candidate
+}
+
 func TestUpdaterRefusals(t *testing.T) {
 	e := newUpdaterEnv(t)
 	other := newTestKey(t)
+	// want is an error, or else what the plan must say.
 	cases := map[string]struct {
-		setup func(*Updater)
-		want  error
-		m     *Manifest
+		setup  func(*Updater)
+		want   error
+		status RouteStatus
+		m      *Manifest
 	}{
-		"older only": {nil, ErrUpToDate, manifestOf("app", e.release(t, "0.9.0", ""))},
-		"downgrade allowed": {func(u *Updater) { u.AllowDowngrade = true }, nil,
+		"older only": {nil, nil, RouteCurrent, manifestOf("app", e.release(t, "0.9.0", ""))},
+		"downgrade with grant": {func(u *Updater) { u.Grants = []string{GrantDowngradeAny} }, nil, RouteAvailable,
 			manifestOf("app", e.release(t, "0.9.0", ""))},
-		"prerelease hidden":  {nil, ErrUpToDate, manifestOf("app", e.release(t, "2.0.0-rc.1", ""))},
-		"prerelease allowed": {func(u *Updater) { u.AllowPrerelease = true }, nil, manifestOf("app", e.release(t, "2.0.0-rc.1", ""))},
-		"channel hidden":     {nil, ErrUpToDate, manifestOf("app", e.release(t, "2.0.0", "beta"))},
-		"channel allowed":    {func(u *Updater) { u.Channels = []string{"beta"} }, nil, manifestOf("app", e.release(t, "2.0.0", "beta"))},
-		"wrong product":      {nil, ErrWrongProduct, manifestOf("other", e.release(t, "2.0.0", ""))},
-		"wrong platform":     {func(u *Updater) { u.OS = "windows" }, ErrNoArtifact, manifestOf("app", e.release(t, "2.0.0", ""))},
-		"untrusted":          {func(u *Updater) { u.Trust = other.trust() }, ErrUnsigned, manifestOf("app", e.release(t, "2.0.0", ""))},
-		"no trust":           {func(u *Updater) { u.Trust = Trust{} }, ErrNoTrustedKeys, manifestOf("app", e.release(t, "2.0.0", ""))},
-		"expired": {func(u *Updater) { u.Now = func() time.Time { return testNow.Add(48 * time.Hour) } }, ErrExpiredManifest,
+		"channel hidden":  {nil, nil, RouteCurrent, manifestOf("app", e.release(t, "2.0.0", "beta"))},
+		"channel granted": {func(u *Updater) { u.Grants = []string{"channel:beta"} }, nil, RouteAvailable, manifestOf("app", e.release(t, "2.0.0", "beta"))},
+		"wrong product":   {nil, ErrWrongProduct, 0, manifestOf("other", e.release(t, "2.0.0", ""))},
+		"wrong platform":  {func(u *Updater) { u.OS = "windows" }, nil, RouteHeld, manifestOf("app", e.release(t, "2.0.0", ""))},
+		"untrusted":       {func(u *Updater) { u.Trust = other.trust() }, ErrUnsigned, 0, manifestOf("app", e.release(t, "2.0.0", ""))},
+		"no trust":        {func(u *Updater) { u.Trust = Trust{} }, ErrNoTrustedKeys, 0, manifestOf("app", e.release(t, "2.0.0", ""))},
+		"expired": {func(u *Updater) { u.Now = func() time.Time { return testNow.Add(48 * time.Hour) } }, ErrExpiredManifest, 0,
 			manifestOf("app", e.release(t, "2.0.0", ""))},
-		"too large": {func(u *Updater) { u.MaxArtifactSize = 10 }, ErrTooLarge, manifestOf("app", e.release(t, "2.0.0", ""))},
+		"too large": {func(u *Updater) { u.MaxArtifactSize = 10 }, ErrTooLarge, 0, manifestOf("app", e.release(t, "2.0.0", ""))},
 		"authorize": {func(u *Updater) {
 			u.Authorize = func(_ context.Context, c *Candidate) error {
 				if c.Version == "2.0.0" {
@@ -140,22 +159,26 @@ func TestUpdaterRefusals(t *testing.T) {
 				}
 				return nil
 			}
-		}, ErrRefused, manifestOf("app", e.release(t, "2.0.0", ""))},
-		"same version":       {func(u *Updater) { u.Current = "2.0.0" }, ErrUpToDate, manifestOf("app", e.release(t, "2.0.0", ""))},
-		"reinstall":          {func(u *Updater) { u.Current = "2.0.0"; u.Reinstall = true }, nil, manifestOf("app", e.release(t, "2.0.0", ""))},
-		"reinstall no older": {func(u *Updater) { u.Reinstall = true }, ErrUpToDate, manifestOf("app", e.release(t, "0.9.0", ""))},
-		"bad current":        {func(u *Updater) { u.Current = "" }, ErrInvalidVersion, manifestOf("app", e.release(t, "2.0.0", ""))},
+		}, ErrRefused, 0, manifestOf("app", e.release(t, "2.0.0", ""))},
+		"same version": {func(u *Updater) { u.Current = "2.0.0" }, nil, RouteCurrent, manifestOf("app", e.release(t, "2.0.0", ""))},
+		"reinstall": {func(u *Updater) { u.Current = "2.0.0"; u.Grants = []string{GrantReinstall} }, nil, RouteAvailable,
+			manifestOf("app", e.release(t, "2.0.0", ""))},
+		"reinstall no older": {func(u *Updater) { u.Grants = []string{GrantReinstall} }, nil, RouteCurrent, manifestOf("app", e.release(t, "0.9.0", ""))},
+		"bad current":        {func(u *Updater) { u.Current = "" }, ErrInvalidVersion, 0, manifestOf("app", e.release(t, "2.0.0", ""))},
 	}
 	for name, c := range cases {
 		u := e.publish(t, c.m)
 		if c.setup != nil {
 			c.setup(u)
 		}
-		cand, err := u.Check(t.Context())
+		plan, err := u.Check(t.Context())
 		if !errors.Is(err, c.want) {
 			t.Errorf("%s: err = %v, want %v", name, err, c.want)
 		}
-		if c.want == nil && name == "downgrade allowed" && (cand == nil || !cand.Downgrade) {
+		if c.want == nil && err == nil && plan.Route.Status != c.status {
+			t.Errorf("%s: status %d, want %d", name, plan.Route.Status, c.status)
+		}
+		if name == "downgrade with grant" && (plan == nil || plan.Candidate == nil || !plan.Candidate.Downgrade) {
 			t.Errorf("%s: downgrade not flagged", name)
 		}
 	}
@@ -182,10 +205,7 @@ func TestUpdaterSameMemberTwiceAndVerify(t *testing.T) {
 		dat := filepath.Join(t.TempDir(), "app.dat")
 		return Extract(t.Context(), artifact, c.Artifact.Size, c.Artifact.Format, []Member{{Name: "app.dat", Path: dat}}, ExtractOptions{})
 	}
-	c, err := u.Check(t.Context())
-	if err != nil {
-		t.Fatal(err)
-	}
+	c := check(t, u)
 	u.DryRun = true
 	if err := u.Install(t.Context(), c); err != nil {
 		t.Fatal(err)
@@ -256,14 +276,14 @@ func TestUpdaterDryRunAndResume(t *testing.T) {
 	}
 }
 
-func TestUpdaterMinPublished(t *testing.T) {
+func TestUpdaterMinSerial(t *testing.T) {
 	e := newUpdaterEnv(t)
 	u := e.publish(t, manifestOf("app", e.release(t, "2.0.0", "")))
-	u.MinPublished = testNow
+	u.MinSerial = e.serial + 1
 	if _, err := u.Check(t.Context()); !errors.Is(err, ErrStaleManifest) {
 		t.Fatalf("old manifest: %v", err)
 	}
-	u.MinPublished = testNow.Add(-2 * time.Hour)
+	u.MinSerial = e.serial
 	if _, err := u.Check(t.Context()); err != nil {
 		t.Fatal(err)
 	}
@@ -273,8 +293,7 @@ func TestUpdaterSharedDownloadDir(t *testing.T) {
 	e := newUpdaterEnv(t)
 	u := e.publish(t, manifestOf("app", e.release(t, "2.0.0", "")))
 	u.DownloadDir = t.TempDir()
-	c, err := u.Check(t.Context())
-	must(t, err)
+	c := check(t, u)
 	l, err := lockFile(bg, filepath.Join(u.DownloadDir, "selfupdate-"+downloadKey(c.artifact)+".download.lock"))
 	must(t, err)
 	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
@@ -333,9 +352,7 @@ func TestUpdaterJournal(t *testing.T) {
 	r.Files = []File{{Member: "app.dat", Target: data}}
 	r.Journal = JournalFor(data)
 	must(t, JournalFor(e.exe).Replace(bg, []Replacement{stage(t, e.exe, "pending")}, ReplaceOptions{Pending: true}))
-	c, err := r.Check(t.Context())
-	must(t, err)
-	must(t, r.Install(t.Context(), c))
+	must(t, r.Install(t.Context(), check(t, r)))
 	if readFile(t, data) != "data 3.0.0" {
 		t.Fatal("data not installed")
 	}
@@ -345,16 +362,15 @@ func TestUpdaterJournal(t *testing.T) {
 func TestUpdaterSelection(t *testing.T) {
 	e := newUpdaterEnv(t)
 	u := e.publish(t, manifestOf("app", e.release(t, "2.0.0", ""), e.release(t, "1.5.0", "")))
-	// A rolled back release is skipped; the next best one is chosen.
-	u.Skip = func(v string) bool { return v == "2.0.0" }
+	// A local rule hides a release; the next best one is chosen.
+	u.LocalRules = []Rule{{ID: "skip", Effect: EffectBlock, To: "=2.0.0"}}
 	var published time.Time
 	u.OnManifest = func(_ context.Context, o *Opened) error {
 		published = o.Manifest.Published
 		return nil
 	}
-	c, err := u.Check(t.Context())
-	if err != nil || c.Version != "1.5.0" {
-		t.Fatalf("skip: %+v %v", c, err)
+	if c := check(t, u); c.Version != "1.5.0" {
+		t.Fatalf("skip: %+v", c)
 	}
 	if !published.Equal(testNow.Add(-time.Hour)) {
 		t.Errorf("OnManifest saw %v", published)
@@ -362,7 +378,7 @@ func TestUpdaterSelection(t *testing.T) {
 	// The manifest is seen also when nothing is newer.
 	published = time.Time{}
 	u.Current = "2.0.0"
-	if _, err := u.Check(t.Context()); !errors.Is(err, ErrUpToDate) || published.IsZero() {
+	if p, err := u.Check(t.Context()); err != nil || p.Candidate != nil || published.IsZero() {
 		t.Errorf("up to date: %v %v", err, published)
 	}
 	u.OnManifest = func(context.Context, *Opened) error { return errors.New("stop") }
@@ -371,13 +387,12 @@ func TestUpdaterSelection(t *testing.T) {
 	}
 	// A misnamed artifact is reported, not taken for "up to date".
 	u.OnManifest, u.Current, u.Name = nil, "1.0.0", "ap"
-	if _, err := u.Check(t.Context()); !errors.Is(err, ErrNoArtifact) {
-		t.Errorf("wrong name: %v", err)
+	if p, err := u.Check(t.Context()); err != nil || p.Route.Status != RouteHeld || len(p.Route.Unusable) == 0 {
+		t.Errorf("wrong name: %+v %v", p, err)
 	}
 	// Candidates are bound to the updater that checked them.
-	u.Name, u.Skip = "", nil
-	c, err = u.Check(t.Context())
-	must(t, err)
+	u.Name, u.LocalRules = "", nil
+	c := check(t, u)
 	other := *u
 	if err := other.Apply(t.Context(), c); !errors.Is(err, ErrNotChecked) {
 		t.Errorf("candidate of another updater: %v", err)
@@ -387,26 +402,27 @@ func TestUpdaterSelection(t *testing.T) {
 func TestUpdaterDirectoryAndDirSource(t *testing.T) {
 	e := newUpdaterEnv(t)
 	media := t.TempDir()
-	data := tarGz(t, true, tarEntry{name: "app", body: "app 2.0.0"}, tarEntry{name: "web/index.html", body: "v2"})
+	data := tarGz(t, true, tarEntry{name: "app", body: "app 2.0.0"}, tarEntry{name: "web/index.html", body: "new"})
 	must(t, os.WriteFile(filepath.Join(media, "app.tar.gz"), data, 0o644))
 	a := artifactFor("app", "app.tar.gz", FormatTarGzip, data)
 	must(t, os.WriteFile(filepath.Join(media, "manifest.json"), mustSign(t, manifestOf("app", Release{Version: "2.0.0", Artifacts: []Artifact{a}}), e.key), 0o644))
 	web := filepath.Join(filepath.Dir(e.exe), "web")
 	must(t, os.Mkdir(web, 0o755))
-	must(t, os.WriteFile(filepath.Join(web, "index.html"), []byte("v1"), 0o644))
+	must(t, os.WriteFile(filepath.Join(web, "index.html"), []byte("old"), 0o644))
 	u := &Updater{
-		Source: &DirSource{Dir: media}, Trust: e.key.trust(), Now: func() time.Time { return testNow },
+		Sources: []Source{&DirSource{Dir: media}}, Trust: e.key.trust(), Now: func() time.Time { return testNow },
+		State:   FileState(filepath.Join(t.TempDir(), "state.json")),
 		Product: "app", Current: "1.0.0", Executable: e.exe,
 		Files: []File{{Member: "app", Target: "app"}, {Member: "web", Target: "web", Dir: true}},
 	}
 	if _, err := u.Update(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	if readFile(t, e.exe) != "app 2.0.0" || readFile(t, filepath.Join(web, "index.html")) != "v2" {
+	if readFile(t, e.exe) != "app 2.0.0" || readFile(t, filepath.Join(web, "index.html")) != "new" {
 		t.Fatal("not installed")
 	}
 	must(t, JournalFor(e.exe).Rollback(bg))
-	if readFile(t, e.exe) != "app 1.0.0" || readFile(t, filepath.Join(web, "index.html")) != "v1" {
+	if readFile(t, e.exe) != "app 1.0.0" || readFile(t, filepath.Join(web, "index.html")) != "old" {
 		t.Fatal("not rolled back")
 	}
 	if got := listDir(t, filepath.Dir(e.exe)); !slices.Equal(got, []string{"app", "web"}) {

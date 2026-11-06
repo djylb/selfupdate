@@ -6,16 +6,23 @@
 //	selfupdate keygen -out release.key
 //	selfupdate pubkey -key release.key
 //	selfupdate artifact -name app -os linux -arch amd64 [-format tar.gz] [-url URL] [-member app]
-//	        [-into manifest.json -version 1.5.0 [-channel beta] [-notes text]] dist/app_linux_amd64.tar.gz
-//	selfupdate sign -key release.key [-expires 720h] [-in manifest.json] [-out manifest.signed.json]
+//	        [-into manifest.json -version 1.5.0 [-channel beta] [-notes text] [-provides cap]...] dist/app_linux_amd64.tar.gz
+//	selfupdate sign -key release.key [-expires 720h] [-serial n] [-in manifest.json] [-out manifest.signed.json]
+//	selfupdate lint [-in manifest.json] [-previous old.json] [-budget n]
+//	selfupdate simulate [-in manifest.json] [-budget n]
+//	selfupdate revert -from old.json -in manifest.json [-out manifest.json]
 //	selfupdate verify -pub ed25519:... [-in manifest.signed.json] [-dist dir] [-fetch] [-out manifest.json]
 //	selfupdate sign-file -key release.key [-out file.sig] file
 //	selfupdate verify-file -pub ed25519:... -sig file.sig file
 //
 // The manifest given to sign is the JSON form of selfupdate.Manifest, read
-// as strictly as clients read it. Signing always sets "published" to now
-// and "expires" to now plus -expires, so re-signing the output of verify
-// renews it. -format defaults to what the file name implies; a file name
+// strictly: an unknown field is an error, and so is a finding of level error
+// from lint. Signing always sets "published" to now, "expires" to now plus
+// -expires and "serial" to one above its input (or -serial), so re-signing the
+// output of verify renews it. lint reports mistakes in valid manifests and
+// says how much it walked; simulate prints the route per source version, for
+// review. revert prepares an older manifest for signing with a serial that
+// still grows, since clients refuse lower ones. -format defaults to what the file name implies; a file name
 // that implies none (a raw file) needs -format raw. -member checks that an
 // archive holds the named files. -into adds the artifact to a release of a
 // manifest file, creating the release if needed. Given -dist or -fetch,
@@ -28,6 +35,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"crypto/ed25519"
 	"encoding/hex"
@@ -40,7 +48,9 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
+	"text/tabwriter"
 	"time"
 
 	"github.com/djylb/selfupdate"
@@ -53,7 +63,7 @@ func main() {
 	}
 }
 
-const usage = "usage: selfupdate keygen|pubkey|artifact|sign|verify|sign-file|verify-file [flags]"
+const usage = "usage: selfupdate keygen|pubkey|artifact|sign|lint|simulate|revert|verify|sign-file|verify-file [flags]"
 
 func run(args []string, stdin io.Reader, stdout io.Writer) error {
 	if len(args) == 0 {
@@ -64,6 +74,9 @@ func run(args []string, stdin io.Reader, stdout io.Writer) error {
 		"pubkey":      pubkey,
 		"artifact":    artifact,
 		"sign":        signCmd,
+		"lint":        lint,
+		"simulate":    simulate,
+		"revert":      revert,
 		"verify":      verify,
 		"sign-file":   signFile,
 		"verify-file": verifyFile,
@@ -128,6 +141,8 @@ func artifact(args []string, _ io.Reader, stdout io.Writer) error {
 	version := flags.String("version", "", "release version, with -into")
 	channel := flags.String("channel", "", "release channel of a new release, with -into")
 	notes := flags.String("notes", "", "release notes of a new release, with -into")
+	var provides stringList
+	flags.Var(&provides, "provides", "capability of the release, with -into (repeatable); give the complete set the build exports")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -162,7 +177,7 @@ func artifact(args []string, _ io.Reader, stdout io.Writer) error {
 		return err
 	}
 	if *into != "" {
-		return addToManifest(*into, *version, *channel, *notes, a)
+		return addToManifest(*into, *version, *channel, *notes, provides, a)
 	}
 	enc := json.NewEncoder(stdout)
 	enc.SetIndent("", "  ")
@@ -194,7 +209,7 @@ func checkMembers(file string, a selfupdate.Artifact, names []string) error {
 	return nil
 }
 
-func addToManifest(path, version, channel, notes string, a selfupdate.Artifact) error {
+func addToManifest(path, version, channel, notes string, provides []string, a selfupdate.Artifact) error {
 	if version == "" {
 		return errors.New("artifact: -into needs -version")
 	}
@@ -216,15 +231,21 @@ func addToManifest(path, version, channel, notes string, a selfupdate.Artifact) 
 		}
 	}
 	if r == nil {
-		m.Releases = append(m.Releases, selfupdate.Release{Version: version, Channel: channel, Notes: notes})
+		m.Releases = append(m.Releases, selfupdate.Release{Version: version, Notes: notes})
 		r = &m.Releases[len(m.Releases)-1]
-	} else if channel != "" && channel != r.Channel {
-		return fmt.Errorf("artifact: release %s is in channel %q", r.Version, r.Channel)
+		if channel != "" {
+			r.Channels = []string{channel}
+		}
+	} else if channel != "" && !slices.Contains(r.Channels, channel) {
+		return fmt.Errorf("artifact: release %s is in channels %q", r.Version, r.Channels)
+	}
+	if len(provides) > 0 {
+		r.Provides = provides
 	}
 	overlaps := func(x, y string) bool { return x == "" || y == "" || x == y }
 	for _, o := range r.Artifacts {
-		if o.Name == a.Name && overlaps(o.OS, a.OS) && overlaps(o.Arch, a.Arch) {
-			return fmt.Errorf("artifact: release %s already has an artifact %s for %s/%s", r.Version, o.Name, o.OS, o.Arch)
+		if o.Name == a.Name && o.Format == a.Format && overlaps(o.OS, a.OS) && overlaps(o.Arch, a.Arch) {
+			return fmt.Errorf("artifact: release %s already has a %v artifact %s for %s/%s", r.Version, o.Format, o.Name, o.OS, o.Arch)
 		}
 	}
 	r.Artifacts = append(r.Artifacts, a)
@@ -282,6 +303,7 @@ func signCmd(args []string, stdin io.Reader, stdout io.Writer) error {
 	var keys stringList
 	flags.Var(&keys, "key", "private key file (repeatable)")
 	expires := flags.Duration("expires", 30*24*time.Hour, "validity from now")
+	serial := flags.Uint64("serial", 0, "serial to use; default one above the input")
 	in := flags.String("in", "-", "manifest JSON")
 	out := flags.String("out", "-", "signed manifest")
 	if err := flags.Parse(args); err != nil {
@@ -304,11 +326,129 @@ func signCmd(args []string, stdin io.Reader, stdout io.Writer) error {
 	}
 	now := time.Now().UTC().Truncate(time.Second)
 	m.Published, m.Expires = now, now.Add(*expires)
+	m.Serial++
+	if *serial != 0 {
+		m.Serial = *serial
+	}
+	report := m.Lint(selfupdate.LintOptions{})
+	for _, f := range report.Findings {
+		if f.Level == selfupdate.LintError {
+			return fmt.Errorf("sign: %s: %s", f.Code, f.Message)
+		}
+	}
 	signed, err := selfupdate.SignManifest(m, privs...)
 	if err != nil {
 		return err
 	}
 	return writeOutput(*out, stdout, append(signed, '\n'))
+}
+
+func readManifest(name string, stdin io.Reader) (*selfupdate.Manifest, error) {
+	data, err := readInput(name, stdin)
+	if err != nil {
+		return nil, err
+	}
+	return selfupdate.DecodeManifest(data)
+}
+
+func lint(args []string, stdin io.Reader, stdout io.Writer) error {
+	flags := flag.NewFlagSet("lint", flag.ContinueOnError)
+	in := flags.String("in", "-", "manifest JSON")
+	previous := flags.String("previous", "", "manifest JSON this one follows")
+	budget := flags.Int("budget", 0, "combinations to walk; default one million")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	m, err := readManifest(*in, stdin)
+	if err != nil {
+		return err
+	}
+	o := selfupdate.LintOptions{Budget: *budget}
+	if *previous != "" {
+		if o.Previous, err = readManifest(*previous, nil); err != nil {
+			return err
+		}
+	}
+	report := m.Lint(o)
+	for _, f := range report.Findings {
+		if _, err := fmt.Fprintf(stdout, "%s %s: %s\n", f.Level, f.Code, f.Message); err != nil {
+			return err
+		}
+	}
+	if _, err := fmt.Fprintf(stdout, "walked %d combinations, exhausted %v, not enumerated: %s\n", report.Coverage.Combinations,
+		report.Coverage.Exhausted, strings.Join(report.Coverage.Unverified, ", ")); err != nil {
+		return err
+	}
+	if report.HasErrors() {
+		return errors.New("lint: errors found")
+	}
+	return nil
+}
+
+func simulate(args []string, stdin io.Reader, stdout io.Writer) error {
+	flags := flag.NewFlagSet("simulate", flag.ContinueOnError)
+	in := flags.String("in", "-", "manifest JSON")
+	budget := flags.Int("budget", 0, "combinations to walk; default one million")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	m, err := readManifest(*in, stdin)
+	if err != nil {
+		return err
+	}
+	rows, cov := m.Simulate(selfupdate.SimOptions{Budget: *budget})
+	w := tabwriter.NewWriter(stdout, 0, 0, 2, ' ', 0)
+	if _, err := fmt.Fprintln(w, "FROM\tPLATFORM\tGRANTS\tFACTS\tNEXT\tGOAL\tHORIZON\tLATEST\tBLOCKED"); err != nil {
+		return err
+	}
+	for _, r := range rows {
+		var blocked []string
+		for _, b := range r.Blocked {
+			blocked = append(blocked, cmp.Or(b.RuleID, b.Code))
+		}
+		facts, err := json.Marshal(r.Facts)
+		if err != nil {
+			return err
+		}
+		if _, err := fmt.Fprintf(w, "%s\t%s/%s/%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", r.From, r.OS, r.Arch, r.Name, strings.Join(r.Grants, ","), facts,
+			cmp.Or(r.Next, "-"), r.Goal, r.Horizon, r.Latest, strings.Join(blocked, ",")); err != nil {
+			return err
+		}
+	}
+	if err := w.Flush(); err != nil {
+		return err
+	}
+	if !cov.Exhausted {
+		return fmt.Errorf("simulate: stopped after %d combinations", cov.Combinations)
+	}
+	return nil
+}
+
+func revert(args []string, stdin io.Reader, stdout io.Writer) error {
+	flags := flag.NewFlagSet("revert", flag.ContinueOnError)
+	from := flags.String("from", "", "older manifest JSON to go back to (required)")
+	in := flags.String("in", "-", "current manifest JSON")
+	out := flags.String("out", "-", "manifest JSON to sign")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if *from == "" {
+		return errors.New("revert: -from is required")
+	}
+	old, err := readManifest(*from, nil)
+	if err != nil {
+		return err
+	}
+	cur, err := readManifest(*in, stdin)
+	if err != nil {
+		return err
+	}
+	old.Serial = max(old.Serial, cur.Serial)
+	b, err := json.MarshalIndent(old, "", "  ")
+	if err != nil {
+		return err
+	}
+	return writeOutput(*out, stdout, append(b, '\n'))
 }
 
 func verify(args []string, stdin io.Reader, stdout io.Writer) error {

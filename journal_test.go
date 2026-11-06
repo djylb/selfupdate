@@ -123,12 +123,12 @@ func TestJournalExplicitRollback(t *testing.T) {
 func TestJournalImmediate(t *testing.T) {
 	dir := t.TempDir()
 	db := filepath.Join(dir, "rules.db")
-	must(t, os.WriteFile(db, []byte("v1"), 0o600))
+	must(t, os.WriteFile(db, []byte("old"), 0o600))
 	j := JournalFor(db)
-	if err := j.Replace(bg, []Replacement{stage(t, db, "v2")}, ReplaceOptions{}); err != nil {
+	if err := j.Replace(bg, []Replacement{stage(t, db, "new")}, ReplaceOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	if readFile(t, db) != "v2" || !slices.Equal(listDir(t, dir), []string{"rules.db"}) {
+	if readFile(t, db) != "new" || !slices.Equal(listDir(t, dir), []string{"rules.db"}) {
 		t.Fatalf("immediate: %v", listDir(t, dir))
 	}
 	if err := j.Commit(bg); !errors.Is(err, ErrNotPending) {
@@ -273,8 +273,8 @@ func TestPrepareTouchesNothing(t *testing.T) {
 	a := filepath.Join(dir, "a")
 	must(t, os.WriteFile(a, []byte("old"), 0o644))
 	j := JournalFor(a)
-	must(t, j.Replace(bg, []Replacement{stage(t, a, "v1")}, ReplaceOptions{Pending: true}))
-	if _, err := newJournalFile(a, stage(t, a, "v2").Staged); err != nil {
+	must(t, j.Replace(bg, []Replacement{stage(t, a, "old")}, ReplaceOptions{Pending: true}))
+	if _, err := newJournalFile(a, stage(t, a, "new").Staged); err != nil {
 		t.Fatal(err)
 	}
 	if err := j.Replace(bg, []Replacement{stage(t, a, "v3")}, ReplaceOptions{}); !errors.Is(err, ErrBusy) {

@@ -40,7 +40,7 @@ func TestSignAndVerify(t *testing.T) {
 		t.Fatal(err)
 	}
 	manifest := filepath.Join(dir, "manifest.json")
-	if err := os.WriteFile(manifest, []byte(`{"product":"app","published":"0001-01-01T00:00:00Z","expires":"0001-01-01T00:00:00Z","releases":[]}`), 0o644); err != nil {
+	if err := os.WriteFile(manifest, []byte(`{"format":1,"baseline":[],"product":"app","published":"0001-01-01T00:00:00Z","expires":"0001-01-01T00:00:00Z","releases":[]}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	add := []string{"artifact", "-name", "app", "-format", "raw", "-into", manifest, "-version", "1.0.0", bin}
@@ -109,8 +109,10 @@ func TestSignStrict(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, in := range []string{
-		`{"product":"app","releases":[{"version":"1.0.0","chanel":"beta","artifacts":[]}]}`,
-		`{"product":"app","releases":[]}}`,
+		`{"format":1,"baseline":[],"product":"app","releases":[{"version":"1.0.0","chanel":"beta","artifacts":[]}]}`,
+		`{"format":1,"baseline":[],"product":"app","releases":[]}}`,
+		`{"format":1,"product":"app","releases":[]}`,
+		`{"format":1,"baseline":[{"id":"a","effect":"block","to":">=2.0.0-0","unlcok":["force"]}],"product":"app","releases":[]}`,
 		`{"product":"app","product":"x","releases":[]}`,
 	} {
 		if err := run([]string{"sign", "-key", keyFile}, strings.NewReader(in), &out); err == nil {
@@ -118,6 +120,35 @@ func TestSignStrict(t *testing.T) {
 		}
 	}
 }
+
+// TestLintSimulateRevert drives the publisher's review commands.
+func TestLintSimulateRevert(t *testing.T) {
+	const m = `{"format":1,"serial":9,"baseline":[],"product":"app","published":"2030-01-01T00:00:00Z","expires":"2030-01-02T00:00:00Z",
+	"releases":[{"version":"1.0.0","artifacts":[{"name":"app","url":"a","size":1,"format":"raw","sha256":"` + zero64 + `"}]}]%s}`
+	var out bytes.Buffer
+	if err := run([]string{"lint"}, strings.NewReader(strings.Replace(m, "%s", "", 1)), &out); err != nil {
+		t.Fatalf("clean manifest: %v\n%s", err, out.String())
+	}
+	bad := strings.Replace(m, "%s", `,"rules":[{"id":"x","effect":"allow","from":"=1.0.0","to":"=1.0.0"},{"id":"x","effect":"block"}]`, 1)
+	if err := run([]string{"lint"}, strings.NewReader(bad), &out); err == nil {
+		t.Error("duplicate id passed lint")
+	}
+	out.Reset()
+	if err := run([]string{"simulate"}, strings.NewReader(strings.Replace(m, "%s", "", 1)), &out); err != nil || !strings.Contains(out.String(), "HORIZON") {
+		t.Errorf("simulate: %v %s", err, out.String())
+	}
+	dir := t.TempDir()
+	old := filepath.Join(dir, "old.json")
+	if err := os.WriteFile(old, []byte(strings.Replace(strings.Replace(m, "%s", "", 1), `"serial":9`, `"serial":3`, 1)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	if err := run([]string{"revert", "-from", old}, strings.NewReader(strings.Replace(m, "%s", "", 1)), &out); err != nil || !strings.Contains(out.String(), `"serial": 9`) {
+		t.Errorf("revert: %v %s", err, out.String())
+	}
+}
+
+const zero64 = "0000000000000000000000000000000000000000000000000000000000000000"
 
 // TestArtifactFormat is a regression test: -format defaulted to raw, so a
 // forgotten flag installed a whole archive as the executable.
@@ -199,7 +230,7 @@ func TestCheckArtifacts(t *testing.T) {
 		{"local mismatch", dir, false, manifest(artifact("app", []byte("local artifacT"))), "mismatch"},
 		{"not http", dir, true, manifest(artifact("file:///etc/passwd", remote)), "not http"},
 		{"scheme-relative", dir, false, manifest(artifact("//host/app", remote)), "needs -fetch"},
-		{"colon path", dir, false, manifest(artifact("v1:2/app", remote)), "needs -fetch"},
+		{"colon path", dir, false, manifest(artifact("a:2/app", remote)), "needs -fetch"},
 	} {
 		err := checkArtifacts(ctx, tc.dir, tc.fetch, tc.m)
 		if err == nil || !strings.Contains(err.Error(), tc.want) {

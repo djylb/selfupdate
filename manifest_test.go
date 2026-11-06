@@ -183,7 +183,7 @@ func FuzzOpenManifest(f *testing.F) {
 			t.Fatal("accepted without a signer")
 		}
 		if o, err := OpenManifest(data, insecure, testNow); err == nil {
-			if o == nil || o.Manifest == nil || o.Manifest.validate() != nil || !testNow.Before(o.Manifest.Expires) {
+			if o == nil || o.Manifest == nil || o.Manifest.validateCore() != nil || !testNow.Before(o.Manifest.Expires) {
 				t.Fatal("accepted an invalid manifest")
 			}
 		}
@@ -195,11 +195,12 @@ func TestPayloadStrict(t *testing.T) {
 	base, err := json.Marshal(sampleManifest())
 	must(t, err)
 	for name, payload := range map[string]string{
-		"unknown field":    strings.Replace(string(base), `"product"`, `"extra":1,"product"`, 1),
 		"duplicate key":    strings.Replace(string(base), `"product":"app"`, `"product":"app","product":"evil"`, 1),
 		"case duplicate":   strings.Replace(string(base), `"product":"app"`, `"product":"app","Product":"evil"`, 1),
 		"nested duplicate": strings.Replace(string(base), `"version":"1.2.0"`, `"version":"1.2.0","version":"9.0.0"`, 1),
 		"trailing":         string(base) + "{}",
+		"no baseline":      strings.Replace(string(base), `"baseline":[],`, ``, 1),
+		"no serial":        strings.Replace(string(base), `"serial":1`, `"serial":0`, 1),
 	} {
 		sigs, err := sign(manifestContext, []byte(payload), []ed25519.PrivateKey{k.priv})
 		must(t, err)
@@ -211,7 +212,7 @@ func TestPayloadStrict(t *testing.T) {
 	}
 }
 
-// TestManifestValidation covers manifests that used to be accepted:
+// TestManifestValidation covers invalid manifests:
 // closing brackets after the document (regression), no publication time,
 // ambiguous artifacts and versions, and a threshold no keys can meet.
 func TestManifestValidation(t *testing.T) {
@@ -230,21 +231,20 @@ func TestManifestValidation(t *testing.T) {
 	app := artifactFor("app", "a", FormatRaw, []byte("x"))
 	linux := app
 	linux.OS = "linux"
+	if _, err := DecodeManifest([]byte(strings.Replace(string(base), `"product"`, `"extra":1,"product"`, 1))); !errors.Is(err, ErrMalformedManifest) {
+		t.Errorf("publisher read an unknown field: %v", err)
+	}
 	for name, m := range map[string]*Manifest{
-		"no published":       {Product: "p", Expires: testNow},
-		"published late":     {Product: "p", Published: testNow, Expires: testNow},
-		"duplicate version":  manifestOf("p", Release{Version: "1.0.0"}, Release{Version: "1.0.0+build"}),
-		"duplicate artifact": manifestOf("p", Release{Version: "1.0.0", Artifacts: []Artifact{app, app}}),
-		"overlap":            manifestOf("p", Release{Version: "1.0.0", Artifacts: []Artifact{app, linux}}),
+		"no published":      {Format: 1, Serial: 1, Baseline: []Rule{}, Product: "p", Expires: testNow},
+		"published late":    {Format: 1, Serial: 1, Baseline: []Rule{}, Product: "p", Published: testNow, Expires: testNow},
+		"duplicate version": manifestOf("p", Release{Version: "1.0.0"}, Release{Version: "1.0.0+build"}),
 	} {
 		if _, err := SignManifest(m, k.priv); !errors.Is(err, ErrMalformedManifest) {
 			t.Errorf("%s: %v", name, err)
 		}
 	}
-	windows := linux
-	windows.OS = "windows"
-	if _, err := SignManifest(manifestOf("p", Release{Version: "1.0.0", Artifacts: []Artifact{linux, windows}}), k.priv); err != nil {
-		t.Errorf("distinct platforms: %v", err)
+	if _, err := SignManifest(manifestOf("p", Release{Version: "1.0.0", Artifacts: []Artifact{linux, app}}), k.priv); err != nil {
+		t.Errorf("overlapping artifacts, the first usable one wins: %v", err)
 	}
 	for name, trust := range map[string]Trust{
 		"threshold": {Keys: []TrustedKey{{Public: k.pub}, {Public: k.pub}}, Threshold: 2},

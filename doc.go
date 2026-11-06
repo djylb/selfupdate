@@ -9,7 +9,11 @@
 //   - [OpenManifest] verifies Ed25519 signatures against a [Trust] policy
 //     with key IDs, several keys, thresholds and key expiry, and rejects
 //     expired manifests;
-//   - [Version] and [CompareVersions] order semantic versions;
+//   - [Version] and [CompareVersions] order semantic versions, and
+//     [VersionSet] names groups of them;
+//   - [Resolve] finds the way from the running version through the rules of a
+//     manifest, as a pure function, with [Manifest.Lint] and
+//     [Manifest.Simulate] for reviewing them before signing;
 //   - [Download] fetches an artifact from a Source with resumption, a size
 //     bound and progress, and returns it verified against the manifest;
 //   - [Extract] and [ExtractDir] unpack raw, gzip, tar, tar.gz and zip
@@ -29,7 +33,7 @@
 //	case selfupdate.StatusPending:
 //		// run a self-check, then j.Commit(ctx)
 //	case selfupdate.StatusRolledBack:
-//		// skip out.Version from now on; selfupdate.Relaunch("", nil)
+//		// u.RecordOutcome(ctx, out); selfupdate.Relaunch("", nil)
 //	case selfupdate.StatusIdle, selfupdate.StatusInProgress, selfupdate.StatusCleanup:
 //	}
 //
