@@ -12,49 +12,32 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"runtime"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/djylb/selfupdate/internal/leakcheck"
 )
 
 // TestMain runs the helper program of the integration test when asked to,
-// and otherwise checks that the tests leave no goroutines behind.
+// and otherwise checks that the tests leave no goroutines behind. Idle
+// connections of the default transport are closed first: the tests share it.
 func TestMain(m *testing.M) {
 	if os.Getenv(helperEnv) != "" {
 		os.Exit(helperMain(os.Args[1:]))
 	}
 	code := m.Run()
 	if code == 0 {
-		if leaked := settleGoroutines(); leaked != "" {
-			_, _ = fmt.Fprintf(os.Stderr, "goroutine leak:\n%s\n", leaked)
+		if t, ok := http.DefaultTransport.(*http.Transport); ok {
+			t.CloseIdleConnections()
+		}
+		if err := leakcheck.Find(); err != nil {
+			_, _ = fmt.Fprintln(os.Stderr, err)
 			code = 1
 		}
 	}
 	os.Exit(code)
-}
-
-// settleGoroutines waits for goroutines started by the tests (this
-// package or the network stack) to end and returns the stacks of any that
-// remain. Runtime-internal goroutines are not counted.
-func settleGoroutines() string {
-	if t, ok := http.DefaultTransport.(*http.Transport); ok {
-		t.CloseIdleConnections()
-	}
-	var leaked []string
-	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(10 * time.Millisecond) {
-		buf := make([]byte, 1<<20)
-		leaked = leaked[:0]
-		for g := range strings.SplitSeq(string(buf[:runtime.Stack(buf, true)]), "\n\n") {
-			if !strings.Contains(g, "TestMain") && (strings.Contains(g, "selfupdate.") || strings.Contains(g, "net/")) {
-				leaked = append(leaked, g)
-			}
-		}
-		if len(leaked) == 0 || time.Now().After(deadline) {
-			return strings.Join(leaked, "\n\n")
-		}
-	}
 }
 
 func must(t testing.TB, err error) {

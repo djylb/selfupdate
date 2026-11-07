@@ -8,7 +8,8 @@ import (
 )
 
 // TestPackageDependencies checks what the README promises: every package,
-// tests included, depends on the standard library alone.
+// tests included, depends on the standard library alone. The tests may use
+// the internal leak check.
 func TestPackageDependencies(t *testing.T) {
 	if runtime.GOOS == "js" || runtime.GOOS == "wasip1" {
 		t.Skip("cannot run the go command")
@@ -21,8 +22,10 @@ func TestPackageDependencies(t *testing.T) {
 		t.Skip("not run from the module source")
 	}
 	const module = "github.com/djylb/selfupdate"
+	leakcheck := module + "/internal/leakcheck"
 	allowed := map[string][]string{
 		module:                     nil,
+		leakcheck:                  nil,
 		module + "/cmd/selfupdate": {module},
 	}
 	listed, err := exec.Command(goCmd, "list", module+"/...").Output()
@@ -43,7 +46,7 @@ func TestPackageDependencies(t *testing.T) {
 			path, std, _ := strings.Cut(strings.TrimSpace(line), " ")
 			path, _, _ = strings.Cut(path, " ")
 			switch {
-			case path == pkg || path == pkg+".test" || strings.HasPrefix(path, pkg+"_test"):
+			case path == pkg || path == pkg+".test" || strings.HasPrefix(path, pkg+"_test"), path == leakcheck:
 			case strings.HasPrefix(path, module):
 				ok := false
 				for _, p := range internal {
