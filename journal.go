@@ -709,8 +709,8 @@ func (j Journal) restore(st *journalState) error {
 			return err
 		}
 	}
-	for i := len(st.Files) - 1; i >= 0; i-- {
-		if err := j.restoreFile(st.Files[i]); err != nil {
+	for _, v := range slices.Backward(st.Files) {
+		if err := j.restoreFile(v); err != nil {
 			return err // the journal stays in restoring; retry later
 		}
 	}

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
 	"strings"
@@ -85,9 +86,7 @@ func (d *StateData) MarshalJSON() ([]byte, error) {
 		return known, nil
 	}
 	all := map[string]json.RawMessage{}
-	for k, v := range d.extra {
-		all[k] = v
-	}
+	maps.Copy(all, d.extra)
 	if err := json.Unmarshal(known, &all); err != nil {
 		return nil, err
 	}
