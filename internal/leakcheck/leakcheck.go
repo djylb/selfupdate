@@ -1,8 +1,7 @@
 // Package leakcheck checks test binaries for leaked goroutines: Find lists
 // the goroutines still running besides the caller, the test framework's and
-// the runtime's own, waiting a while for them to end first, and
-// VerifyTestMain fails a whole test binary with them. Where the runtime has
-// the goroutineleak profile, the report adds it: it marks the goroutines
+// the runtime's own, waiting a while for them to end first. Where the runtime
+// has the goroutineleak profile, the report adds it: it marks the goroutines
 // blocked forever on something no running goroutine can reach. It depends on
 // the standard library only.
 package leakcheck
@@ -10,13 +9,11 @@ package leakcheck
 import (
 	"bytes"
 	"fmt"
-	"os"
 	"runtime"
 	"runtime/pprof"
 	"slices"
 	"strconv"
 	"strings"
-	"testing"
 	"time"
 )
 
@@ -57,21 +54,6 @@ func find(wait time.Duration) error {
 		<-t.C
 		pause = min(2*pause, 100*time.Millisecond)
 	}
-}
-
-// VerifyTestMain runs the tests of m and, when they passed, fails the binary
-// if goroutines are left running. Call it from TestMain:
-//
-//	func TestMain(m *testing.M) { leakcheck.VerifyTestMain(m) }
-func VerifyTestMain(m *testing.M) {
-	code := m.Run()
-	if code == 0 {
-		if err := Find(); err != nil {
-			_, _ = fmt.Fprintln(os.Stderr, err) // nowhere to report a failed write
-			code = 1
-		}
-	}
-	os.Exit(code)
 }
 
 // leakProfile returns the goroutineleak profile when it lists goroutines,
